@@ -1,4 +1,4 @@
-# Player Traces
+# Better Player Traces
 
 Traces is a server-authoritative Forge 1.20.1 mod that records grounded movement and lifecycle markers into compact shard files and renders nearby traces, persistent notes, and animated player echoes.
 
@@ -96,9 +96,9 @@ Death’s Door keeps the player active. The rolling pose recorder continues thro
 
 ## Canonical identity
 
-- Repository and release artifact: `player-traces`
-- Mod ID and resource namespace: `player_traces`
-- Java package: `com.bettercontent.playertraces`
+- Repository and release artifact: `better-player-traces`
+- Mod ID and resource namespace: `better_player_traces`
+- Java package: `com.bettercontent.betterplayertraces`
 - Validation: `./gradlew verifyFull`
 
 This normalization is a clean break. Worlds, configuration files, and integrations created for earlier identities are not migrated or aliased.

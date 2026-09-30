@@ -2,9 +2,9 @@
 
 ## Project identity
 
-- Repository and artifact: `player-traces`
-- Mod ID and resource namespace: `player_traces`
-- Base package: `com.bettercontent.playertraces`
+- Repository and artifact: `better-player-traces`
+- Mod ID and resource namespace: `better_player_traces`
+- Base package: `com.bettercontent.betterplayertraces`
 - Java: 17
 - Forge: 1.20.1-47.4.13
 

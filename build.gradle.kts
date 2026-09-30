@@ -10,7 +10,7 @@ val shaderCompatibilityValidation = providers.gradleProperty("tracesShaderCompat
 val echoPrototypeEnabled = providers.gradleProperty("tracesModCacheDir").isPresent
 
 base {
-    archivesName.set("player-traces")
+    archivesName.set("better-player-traces")
 }
 
 version = "0.1.0"
@@ -108,7 +108,7 @@ minecraft {
             property("forge.logging.markers", "REGISTRIES")
             property("forge.logging.console.level", "debug")
             mods {
-                create("player_traces") {
+                create("better_player_traces") {
                     source(sourceSets["main"])
                     source(sourceSets["test"])
                 }
@@ -125,7 +125,7 @@ minecraft {
             property("mixin.env.refMapRemappingFile", project.file("build/createSrgToMcp/output.srg").absolutePath)
             property("forge.logging.console.level", "info")
             mods {
-                create("player_traces_echo_prototype") {
+                create("better_player_traces_echo_prototype") {
                     source(sourceSets["echoPrototype"])
                 }
             }
@@ -137,7 +137,7 @@ minecraft {
             property("forge.logging.markers", "REGISTRIES")
             property("forge.logging.console.level", "debug")
             mods {
-                create("player_traces") {
+                create("better_player_traces") {
                     source(sourceSets["main"])
                     source(sourceSets["test"])
                 }
@@ -147,11 +147,11 @@ minecraft {
         create("gameTestServer") {
             workingDirectory(project.file("run"))
             args("--nogui")
-            property("forge.enabledGameTestNamespaces", "player_traces")
+            property("forge.enabledGameTestNamespaces", "better_player_traces")
             property("forge.logging.markers", "REGISTRIES")
             property("forge.logging.console.level", "debug")
             mods {
-                create("player_traces") {
+                create("better_player_traces") {
                     source(sourceSets["main"])
                     source(sourceSets["gametest"])
                 }
@@ -269,7 +269,7 @@ val stageRuntimeJar by tasks.registering(Copy::class) {
     dependsOn(tasks.named("reobfJar"))
     from(layout.buildDirectory.file("reobfJar/output.jar"))
     into(layout.buildDirectory.dir("libs"))
-    rename { "player-traces-$version.jar" }
+    rename { "better-player-traces-$version.jar" }
 }
 
 tasks.named("assemble") {

@@ -2,27 +2,27 @@ modLoader="javafml"
 loaderVersion="[47,)"
 license="AGPL-3.0-or-later"
 [[mods]]
-modId="player_traces"
+modId="better_player_traces"
 version="0.1.0"
-displayName="Player Traces"
+displayName="Better Player Traces"
 authors="Better Content"
 description='''Server-authoritative player movement trace system with anonymous sharing and trace-guided wayfinding.''' 
 
-[[dependencies.player_traces]]
+[[dependencies.better_player_traces]]
 modId="forge"
 mandatory=true
 versionRange="[47.4.13,)"
 ordering="NONE"
 side="BOTH"
 
-[[dependencies.player_traces]]
+[[dependencies.better_player_traces]]
 modId="minecraft"
 mandatory=true
 versionRange="[1.20.1]"
 ordering="NONE"
 side="BOTH"
 
-[[dependencies.player_traces]]
+[[dependencies.better_player_traces]]
 modId="kotlinforforge"
 mandatory=true
 versionRange="[4.12.0,)"
@@ -30,14 +30,14 @@ ordering="NONE"
 side="BOTH"
 
 
-[[dependencies.player_traces]]
+[[dependencies.better_player_traces]]
 modId="quark"
 mandatory=false
 versionRange="[4.0-462,4.0-463)"
 ordering="AFTER"
 side="CLIENT"
 
-[[dependencies.player_traces]]
+[[dependencies.better_player_traces]]
 modId="zeta"
 mandatory=false
 versionRange="[1.0-31,1.0-32)"

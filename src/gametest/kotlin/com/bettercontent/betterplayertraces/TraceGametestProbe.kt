@@ -54,7 +54,7 @@ object TraceGametestProbe {
         ),
     )
 
-    @GameTest(batch = "better_player_traces", template = "empty", timeoutTicks = 200)
+    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 200)
     @JvmStatic
     fun persistenceSurvivesRestart(helper: GameTestHelper) {
         val level = helper.level
@@ -99,7 +99,7 @@ object TraceGametestProbe {
         }
     }
 
-    @GameTest(batch = "better_player_traces", template = "empty", timeoutTicks = 200)
+    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 200)
     @JvmStatic
     fun waterErasesTraces(helper: GameTestHelper) {
         val level = helper.level
@@ -132,27 +132,38 @@ object TraceGametestProbe {
         }
     }
 
-    private fun rainFixturePosition(helper: GameTestHelper, coordinate: Int): BlockPos {
+    private fun rainFixturePosition(helper: GameTestHelper, local: BlockPos): BlockPos {
         val level = helper.level
-        level.getChunkAt(BlockPos(coordinate, 64, coordinate))
-        val position = BlockPos(coordinate,
-            level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING, coordinate, coordinate) + 1,
-            coordinate)
-        // These fixtures live outside other trace shards and explicitly select a rainy biome.
+        val column = helper.absolutePos(BlockPos(local.x, 0, local.z))
+        val position = BlockPos(column.x,
+            level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING, column.x, column.z) + 1,
+            column.z)
         level.server.commands.performPrefixedCommand(level.server.createCommandSourceStack().withLevel(level).withSuppressedOutput(),
             "fillbiome ${position.x} ${position.y} ${position.z} ${position.x} ${position.y} ${position.z} minecraft:plains")
         return position
     }
 
-    @GameTest(batch = "better_player_traces", template = "empty", timeoutTicks = 260)
+    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 260)
     @JvmStatic
-    fun rainWeakensExposedTrace(helper: GameTestHelper) {
+    fun rainExposureErodesOnlyUncoveredTrace(helper: GameTestHelper) {
         val level = helper.level
         val storage = TraceStorageManager(level, TracesConfig.common)
         val erosion = ErosionService(storage, TracesConfig.common)
-        val position = rainFixturePosition(helper, 5000)
-        level.setBlockAndUpdate(position.below(), Blocks.STONE.defaultBlockState())
-        val trace = FootTrace(
+        val exposedPosition = rainFixturePosition(helper, BlockPos(5, 0, 5))
+        val shelteredPosition = rainFixturePosition(helper, BlockPos(8, 0, 8))
+        level.setBlockAndUpdate(exposedPosition.below(), Blocks.STONE.defaultBlockState())
+        level.setBlockAndUpdate(shelteredPosition.below(), Blocks.STONE.defaultBlockState())
+        // A second exposed point shares the sheltered trace's chunk. This catches the old
+        // chunk-centre sampling regression while the sheltered point verifies canopy handling.
+        val comparisonPosition = shelteredPosition.offset(5, 0, 5).atY(
+            level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING,
+                shelteredPosition.x + 5, shelteredPosition.z + 5) + 1)
+        level.server.commands.performPrefixedCommand(level.server.createCommandSourceStack().withLevel(level).withSuppressedOutput(),
+            "fillbiome ${comparisonPosition.x} ${comparisonPosition.y} ${comparisonPosition.z} ${comparisonPosition.x} ${comparisonPosition.y} ${comparisonPosition.z} minecraft:plains")
+        level.setBlockAndUpdate(comparisonPosition.below(), Blocks.STONE.defaultBlockState())
+        val coverPos = shelteredPosition.above(30)
+        level.setBlockAndUpdate(coverPos, Blocks.STONE.defaultBlockState())
+        fun traceAt(position: BlockPos) = FootTrace(
             id = UUID.randomUUID(),
             levelKey = level.dimension().location().toString(),
             blockPos = position,
@@ -166,99 +177,55 @@ object TraceGametestProbe {
             sourcePlayerInternal = UUID.randomUUID(),
             support = TraceSupport(position.below(), ResourceLocation("minecraft", "stone")),
         )
-
+        val exposed = traceAt(exposedPosition)
+        val sheltered = traceAt(shelteredPosition)
+        val comparison = traceAt(comparisonPosition)
         try {
-            level.setWeatherParameters(0, 200, true, false)
+            level.setWeatherParameters(0, 240, true, false)
             level.rainLevel = 1f
             level.oRainLevel = 1f
-            helper.assertTrue(level.isRainingAt(position), "precondition: exposed trace receives rain: sky=${level.canSeeSky(position)} rain=${level.getRainLevel(0f)} biome=${level.getBiome(position).unwrapKey()} position=$position")
-            storage.addFootTrace(trace)
+            storage.addFootTrace(exposed)
+            storage.addFootTrace(sheltered)
+            storage.addFootTrace(comparison)
             storage.tickFlush()
-
-            val before = storage.queryTraces(trace.blockPos, trace.blockPos).single { it.id == trace.id }
-            erosion.tick(level, 80)
-            val after = storage.queryTraces(trace.blockPos, trace.blockPos).single { it.id == trace.id }
-
-            helper.assertTrue(after.strength < before.strength || !after.surviving, "exposed rain should reduce trace strength")
-            helper.succeed()
-        } finally {
-            level.setWeatherParameters(0, 0, false, false)
-            storage.close()
-        }
-    }
-
-    @GameTest(batch = "better_player_traces", template = "empty", timeoutTicks = 260)
-    @JvmStatic
-    fun rainShelteredTraceRemains(helper: GameTestHelper) {
-        val level = helper.level
-        val storage = TraceStorageManager(level, TracesConfig.common)
-        val erosion = ErosionService(storage, TracesConfig.common)
-        val position = rainFixturePosition(helper, 6008)
-        level.setBlockAndUpdate(position.below(), Blocks.STONE.defaultBlockState())
-        val trace = FootTrace(
-            id = UUID.randomUUID(),
-            levelKey = level.dimension().location().toString(),
-            blockPos = position,
-            movementClass = MovementClass.WALK,
-            strength = 1.0f,
-            sequenceId = UUID.randomUUID(),
-            sequenceIndex = 0,
-            createdAt = 1,
-            sequenceEpoch = 1,
-            surviving = true,
-            sourcePlayerInternal = UUID.randomUUID(),
-            support = TraceSupport(position.below(), ResourceLocation("minecraft", "stone")),
-        )
-
-        // This exposed footprint shares the chunk but not the sheltered footprint's
-        // canopy. It catches the former chunk-centre erosion behaviour.
-        val exposedX = position.x + 5
-        val exposedZ = position.z + 5
-        val exposedPosition = BlockPos(exposedX,
-            level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING, exposedX, exposedZ) + 1,
-            exposedZ)
-        level.server.commands.performPrefixedCommand(level.server.createCommandSourceStack().withLevel(level).withSuppressedOutput(),
-            "fillbiome ${exposedPosition.x} ${exposedPosition.y} ${exposedPosition.z} ${exposedPosition.x} ${exposedPosition.y} ${exposedPosition.z} minecraft:plains")
-        level.setBlockAndUpdate(exposedPosition.below(), Blocks.STONE.defaultBlockState())
-        val exposedTrace = trace.copy(
-            id = UUID.randomUUID(),
-            x = exposedPosition.x + 0.5,
-            y = exposedPosition.y.toDouble(),
-            z = exposedPosition.z + 0.5,
-            support = TraceSupport(exposedPosition.below(), ResourceLocation("minecraft", "stone")),
-        )
-
-        val coverPos = BlockPos(trace.blockPos.x, trace.blockPos.y + 30, trace.blockPos.z)
-
-        level.setBlockAndUpdate(coverPos, Blocks.STONE.defaultBlockState())
-        level.setWeatherParameters(0, 200, true, false)
-        level.rainLevel = 1f
-        level.oRainLevel = 1f
-        storage.addFootTrace(trace)
-        storage.addFootTrace(exposedTrace)
-        storage.tickFlush()
-        // Skylight propagation is asynchronous; observe the finished shelter, not the write call.
-        helper.runAfterDelay(5L) {
-            try {
-                level.setWeatherParameters(0, 200, true, false)
-                level.rainLevel = 1f
-                level.oRainLevel = 1f
-                helper.assertTrue(!level.canSeeSky(position), "precondition: trace is sheltered")
-                val before = storage.queryTraces(trace.blockPos, trace.blockPos).single { it.id == trace.id }
-                erosion.tick(level, 80)
-                val after = storage.queryTraces(trace.blockPos, trace.blockPos).single { it.id == trace.id }
-                val exposedAfter = storage.queryTraces(exposedTrace.blockPos, exposedTrace.blockPos).single { it.id == exposedTrace.id }
-                helper.assertTrue(after.strength >= before.strength * 0.99f, "sheltered trace should remain stable")
-                helper.succeed()
-            } finally {
-                level.setBlockAndUpdate(coverPos, Blocks.AIR.defaultBlockState())
-                level.setWeatherParameters(0, 0, false, false)
-                storage.close()
+            // Wait for skylight propagation, then validate and erode within the same rain episode.
+            helper.runAfterDelay(10L) {
+                try {
+                    level.setWeatherParameters(0, 240, true, false)
+                    level.rainLevel = 1f
+                    level.oRainLevel = 1f
+                    helper.assertTrue(level.hasChunkAt(exposedPosition) && level.isRainingAt(exposedPosition),
+                        "exposed fixture must remain loaded and receive rain: loaded=${level.hasChunkAt(exposedPosition)} rainAt=${level.isRainingAt(exposedPosition)} rain=${level.getRainLevel(1f)} sky=${level.canSeeSky(exposedPosition)} biome=${level.getBiome(exposedPosition).value().hasPrecipitation()}")
+                    helper.assertTrue(level.hasChunkAt(shelteredPosition) && !level.canSeeSky(shelteredPosition),
+                        "sheltered fixture must remain loaded with its canopy: cover=${level.getBlockState(coverPos)}")
+                    helper.assertTrue(level.isRainingAt(comparisonPosition), "same-chunk comparison fixture must receive rain")
+                    val before = listOf(exposed, sheltered, comparison).associate { trace ->
+                        trace.id to storage.queryTraces(trace.blockPos, trace.blockPos).single { it.id == trace.id }
+                    }
+                    erosion.tick(level, 80)
+                    val after = listOf(exposed, sheltered, comparison).associate { trace ->
+                        trace.id to storage.queryTraces(trace.blockPos, trace.blockPos).single { it.id == trace.id }
+                    }
+                    helper.assertTrue(after.getValue(exposed.id).strength < before.getValue(exposed.id).strength || !after.getValue(exposed.id).surviving,
+                        "rain must weaken an exposed trace")
+                    helper.assertTrue(after.getValue(comparison.id).strength < before.getValue(comparison.id).strength || !after.getValue(comparison.id).surviving,
+                        "rain must weaken the exposed trace sharing the sheltered trace's chunk")
+                    helper.assertTrue(after.getValue(sheltered.id).strength >= before.getValue(sheltered.id).strength * 0.99f,
+                        "rain must preserve the sheltered trace")
+                    helper.succeed()
+                } finally {
+                    level.setBlockAndUpdate(coverPos, Blocks.AIR.defaultBlockState())
+                    level.setWeatherParameters(0, 0, false, false)
+                    storage.close()
+                }
             }
+        } catch (failure: Throwable) {
+            storage.close()
+            throw failure
         }
     }
 
-    @GameTest(batch = "better_player_traces", template = "empty", timeoutTicks = 220)
+    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 220)
     @JvmStatic
     fun annotationPersistsAfterTargetBlockReplaced(helper: GameTestHelper) {
         val level = helper.level
@@ -282,7 +249,7 @@ object TraceGametestProbe {
         }
     }
 
-    @GameTest(batch = "better_player_traces", template = "empty", timeoutTicks = 220)
+    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 220)
     @JvmStatic
     fun globalTeamVisibleToSecondPlayer(helper: GameTestHelper) {
         val level = helper.level
@@ -313,7 +280,7 @@ object TraceGametestProbe {
     }
 
 
-    @GameTest(batch = "better_player_traces", template = "empty", timeoutTicks = 220)
+    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 220)
     @JvmStatic
     fun annotationOwnershipAndRevisionAreEnforced(helper: GameTestHelper) {
         val level = helper.level
@@ -340,7 +307,7 @@ object TraceGametestProbe {
         }
     }
 
-    @GameTest(batch = "better_player_traces", template = "empty", timeoutTicks = 220)
+    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 220)
     @JvmStatic
     fun annotationEchoPersistsRevisesAndDeletesAtomically(helper: GameTestHelper) {
         val level = helper.level
@@ -370,7 +337,7 @@ object TraceGametestProbe {
         }
     }
 
-    @GameTest(batch = "better_player_traces", template = "empty", timeoutTicks = 220)
+    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 220)
     @JvmStatic
     fun annotationEchoCapacityRejectsWithoutEviction(helper: GameTestHelper) {
         val echoes = AnnotationEchoSavedData()
@@ -387,7 +354,7 @@ object TraceGametestProbe {
         helper.succeed()
     }
 
-    @GameTest(batch = "better_player_traces", template = "empty", timeoutTicks = 220)
+    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 220)
     @JvmStatic
     fun deniedEchoEditLeavesNoteAndClipUnchanged(helper: GameTestHelper) {
         val level = helper.level
@@ -414,7 +381,7 @@ object TraceGametestProbe {
         }
     }
 
-    @GameTest(batch = "better_player_traces", template = "empty", timeoutTicks = 220)
+    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 220)
     @JvmStatic
     fun operatorCanReplaceAnnotationEcho(helper: GameTestHelper) {
         val level = helper.level
@@ -442,7 +409,7 @@ object TraceGametestProbe {
         }
     }
 
-    @GameTest(batch = "better_player_traces", template = "empty", timeoutTicks = 220)
+    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 220)
     @JvmStatic
     fun traceJourneyEventsAreCorrelatedAndPublishedOnce(helper: GameTestHelper) {
         val level = helper.level

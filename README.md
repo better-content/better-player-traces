@@ -1,5 +1,12 @@
 # Better Player Traces
 
+## Scope and authority
+
+This repository owns gameplay trace/archive persistence, not development artifact retention.
+Read [local instructions](AGENTS.md) and the
+[shared documentation/policy index](../../better-content-modpack/docs/README.md).
+
+
 Traces is a server-authoritative Forge 1.20.1 mod that records grounded movement and lifecycle markers into compact shard files and renders nearby traces, persistent notes, and animated player echoes.
 
 ## What Traces Is

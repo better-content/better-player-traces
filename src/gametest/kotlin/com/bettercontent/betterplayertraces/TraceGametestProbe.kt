@@ -133,13 +133,25 @@ object TraceGametestProbe {
     }
 
     private fun rainFixturePosition(helper: GameTestHelper, local: BlockPos): BlockPos {
+        return rainFixtureColumn(helper, helper.absolutePos(BlockPos(local.x, 0, local.z)))
+    }
+
+    private fun rainFixtureColumn(helper: GameTestHelper, column: BlockPos): BlockPos {
         val level = helper.level
-        val column = helper.absolutePos(BlockPos(local.x, 0, local.z))
-        val position = BlockPos(column.x,
-            level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING, column.x, column.z) + 1,
-            column.z)
-        level.server.commands.performPrefixedCommand(level.server.createCommandSourceStack().withLevel(level).withSuppressedOutput(),
-            "fillbiome ${position.x} ${position.y} ${position.z} ${position.x} ${position.y} ${position.z} minecraft:plains")
+        // A rain fixture must not inherit terrain height, transparent obstruction,
+        // flowing water or a cold high-altitude biome from a previous native world.
+        // Own only this test's three columns, at a fixed temperate altitude.
+        val position = BlockPos(column.x, 128, column.z)
+        for (y in position.y until level.maxBuildHeight) {
+            level.setBlockAndUpdate(BlockPos(position.x, y, position.z), Blocks.AIR.defaultBlockState())
+        }
+        // BiomeManager uses seed-jittered neighboring quart samples, not the
+        // single quart containing this block. Fill the full sampling envelope.
+        val changed = level.server.commands.performPrefixedCommand(level.server.createCommandSourceStack().withLevel(level).withSuppressedOutput(),
+            "fillbiome ${position.x - 8} ${position.y - 8} ${position.z - 8} ${position.x + 8} ${position.y + 8} ${position.z + 8} minecraft:plains")
+        helper.assertTrue(changed > 0, "native plains fixture biome command must succeed")
+        helper.assertTrue(level.getBiome(position).value().getPrecipitationAt(position) == net.minecraft.world.level.biome.Biome.Precipitation.RAIN,
+            "native fixture biome must provide rain: pos=$position biome=${level.getBiome(position).unwrapKey()} precipitation=${level.getBiome(position).value().getPrecipitationAt(position)}")
         return position
     }
 
@@ -155,11 +167,14 @@ object TraceGametestProbe {
         level.setBlockAndUpdate(shelteredPosition.below(), Blocks.STONE.defaultBlockState())
         // A second exposed point shares the sheltered trace's chunk. This catches the old
         // chunk-centre sampling regression while the sheltered point verifies canopy handling.
-        val comparisonPosition = shelteredPosition.offset(5, 0, 5).atY(
-            level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING,
-                shelteredPosition.x + 5, shelteredPosition.z + 5) + 1)
-        level.server.commands.performPrefixedCommand(level.server.createCommandSourceStack().withLevel(level).withSuppressedOutput(),
-            "fillbiome ${comparisonPosition.x} ${comparisonPosition.y} ${comparisonPosition.z} ${comparisonPosition.x} ${comparisonPosition.y} ${comparisonPosition.z} minecraft:plains")
+        // Stay inside the same native chunk even when the GameTest arena is
+        // translated across a chunk edge; a fixed +5 offset did not guarantee it.
+        val comparisonColumn = BlockPos(
+            shelteredPosition.x + if ((shelteredPosition.x and 15) <= 10) 5 else -5, 0,
+            shelteredPosition.z + if ((shelteredPosition.z and 15) <= 10) 5 else -5)
+        val comparisonPosition = rainFixtureColumn(helper, comparisonColumn)
+        helper.assertTrue(net.minecraft.world.level.ChunkPos(comparisonPosition) == net.minecraft.world.level.ChunkPos(shelteredPosition),
+            "comparison and sheltered traces must share the same native chunk")
         level.setBlockAndUpdate(comparisonPosition.below(), Blocks.STONE.defaultBlockState())
         val coverPos = shelteredPosition.above(30)
         level.setBlockAndUpdate(coverPos, Blocks.STONE.defaultBlockState())
@@ -195,10 +210,10 @@ object TraceGametestProbe {
                     level.rainLevel = 1f
                     level.oRainLevel = 1f
                     helper.assertTrue(level.hasChunkAt(exposedPosition) && level.isRainingAt(exposedPosition),
-                        "exposed fixture must remain loaded and receive rain: loaded=${level.hasChunkAt(exposedPosition)} rainAt=${level.isRainingAt(exposedPosition)} rain=${level.getRainLevel(1f)} sky=${level.canSeeSky(exposedPosition)} biome=${level.getBiome(exposedPosition).value().hasPrecipitation()}")
+                        "exposed fixture must remain loaded and receive rain: loaded=${level.hasChunkAt(exposedPosition)} rainAt=${level.isRainingAt(exposedPosition)} rain=${level.getRainLevel(1f)} sky=${level.canSeeSky(exposedPosition)} biome=${level.getBiome(exposedPosition).unwrapKey()} precipitation=${level.getBiome(exposedPosition).value().getPrecipitationAt(exposedPosition)} pos=$exposedPosition height=${level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING, exposedPosition.x, exposedPosition.z)}")
                     helper.assertTrue(level.hasChunkAt(shelteredPosition) && !level.canSeeSky(shelteredPosition),
                         "sheltered fixture must remain loaded with its canopy: cover=${level.getBlockState(coverPos)}")
-                    helper.assertTrue(level.isRainingAt(comparisonPosition), "same-chunk comparison fixture must receive rain")
+                    helper.assertTrue(level.isRainingAt(comparisonPosition), "same-chunk comparison fixture must receive rain: rain=${level.getRainLevel(1f)} sky=${level.canSeeSky(comparisonPosition)} biome=${level.getBiome(comparisonPosition).unwrapKey()} precipitation=${level.getBiome(comparisonPosition).value().getPrecipitationAt(comparisonPosition)} pos=$comparisonPosition height=${level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING, comparisonPosition.x, comparisonPosition.z)}")
                     val before = listOf(exposed, sheltered, comparison).associate { trace ->
                         trace.id to storage.queryTraces(trace.blockPos, trace.blockPos).single { it.id == trace.id }
                     }

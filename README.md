@@ -9,6 +9,8 @@ Read [local instructions](AGENTS.md) and the
 
 Traces is a server-authoritative Forge 1.20.1 mod that records grounded movement and lifecycle markers into compact shard files and renders nearby traces, persistent notes, and animated player echoes.
 
+See [bounded playtest observations](docs/playtest-observations.md) for causal storage/annotation diagnostics and privacy limits.
+
 ## What Traces Is
 - Captures foot traces from grounded player movement.
 - Marks login, logout, respawn, and both sides of dimension travel with anonymous arrival/departure symbols.

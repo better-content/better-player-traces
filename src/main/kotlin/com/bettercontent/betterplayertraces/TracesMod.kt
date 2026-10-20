@@ -23,6 +23,7 @@ import java.util.WeakHashMap
 @Mod(TracesMod.MOD_ID)
 class TracesMod {
     init {
+        com.bettercontent.betterplayertraces.diagnostics.RuntimeDiagnostics.initialize()
         val modBus = FMLJavaModLoadingContext.get().modEventBus
         TracesItems.REGISTRY.register(modBus)
         MinecraftForge.EVENT_BUS.register(TracesForgeEvents)

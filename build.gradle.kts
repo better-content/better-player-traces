@@ -1,3 +1,5 @@
+import java.util.UUID
+
 plugins {
     kotlin("jvm") version "2.2.21"
     id("net.minecraftforge.gradle") version "6.0.24"
@@ -91,6 +93,9 @@ if (!echoPrototypeEnabled) {
     }
 }
 
+// Every native attempt is retained independently; never reset the shared client run/saves.
+val nativeRunDirectory = project.file("run-gametest/attempts/${UUID.randomUUID()}")
+
 minecraft {
     mappings("official", minecraftVersion)
 
@@ -145,7 +150,7 @@ minecraft {
         }
 
         create("gameTestServer") {
-            workingDirectory(project.file("run"))
+            workingDirectory(nativeRunDirectory)
             args("--nogui")
             property("forge.enabledGameTestNamespaces", "better_player_traces")
             property("forge.logging.markers", "REGISTRIES")
@@ -186,7 +191,7 @@ tasks {
     register("verifyFast") {
         group = "verification"
         description = "Compile + unit checks for fast feedback"
-        dependsOn("compileKotlin", "compileJava", "test")
+        dependsOn("compileKotlin", "compileJava", "test", "verifyNativeSetup")
     }
 
     register("verifyEchoPrototype") {
@@ -216,14 +221,14 @@ tasks {
 
     register<Copy>("prepareGametestStructures") {
         from("src/gametest/resources/gameteststructures")
-        into("run/gameteststructures")
+        into(nativeRunDirectory.resolve("gameteststructures"))
         include("*.snbt")
     }
 
     register("verifyFull") {
         group = "verification"
         description = "Fast verify and headless GameTest"
-        dependsOn("verifyFast", "headlessGameTest")
+        dependsOn("verifyFast", "verifyNativeDiagnostics")
     }
 
     register<Sync>("prepareVisualValidation") {
@@ -276,10 +281,31 @@ tasks.named("assemble") {
     dependsOn(stageRuntimeJar)
 }
 
+val verifyNativeSetup by tasks.registering(Exec::class) {
+    commandLine("python3", "-B", "-m", "unittest", "discover", "-s", "scripts", "-p", "test_native_properties.py")
+}
+val prepareNativeProperties by tasks.registering(Exec::class) {
+    commandLine("python3", "-B", "scripts/ensure_native_properties.py", nativeRunDirectory.absolutePath)
+}
+val verifyNativeDiagnostics by tasks.registering {
+    dependsOn("headlessGameTest")
+    doLast {
+        val log = nativeRunDirectory.resolve("logs/latest.log")
+        check(log.isFile) { "Missing current native diagnostics: $log" }
+        val text = log.readText()
+        check(text.contains("All 11 required tests passed") && text.contains("11 GAME TESTS COMPLETE")) {
+            "Missing eleven-test native completion: $log"
+        }
+        val errors = text.lineSequence().filter { line ->
+            listOf("/ERROR]", "/FATAL]", "[ERROR]", "[FATAL]", "Mixin apply failed").any(line::contains)
+        }.toList()
+        check(errors.isEmpty()) { "Native failed-operation diagnostics: ${errors.take(8)}" }
+    }
+}
 tasks.matching {
     it.name == "runGameTestServer"
 }.configureEach {
-    dependsOn("prepareGametestStructures")
+    dependsOn("prepareGametestStructures", prepareNativeProperties)
 }
 
 tasks.matching {

@@ -827,8 +827,10 @@ class TraceStorageManager(
     private fun writeSnapshot(id: TraceShardId, snapshot: TraceShardState) {
         val path = shardPath(id)
         val payload = TraceSerializer.encodeV3(snapshot, Geometry.shardToBounds(id.regionX, id.regionZ))
-        TraceArchive.publish(path, payload, snapshot.archiveRevision())
-        log.debug("Flushed trace shard {} to {}", id, path)
+        val published = TraceArchive.publish(path, payload, snapshot.archiveRevision())
+        val diagnostics = com.bettercontent.betterplayertraces.diagnostics.RuntimeDiagnostics.LOG
+        if (diagnostics.enabled("persistence")) com.bettercontent.betterplayertraces.diagnostics.FeatureObservation.archive(
+            diagnostics, published, snapshot.archiveRevision(), payload.size)
     }
 
     fun tickFlush() {

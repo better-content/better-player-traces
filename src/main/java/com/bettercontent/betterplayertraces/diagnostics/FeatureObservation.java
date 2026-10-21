@@ -7,9 +7,10 @@ public final class FeatureObservation {
         if (!log.enabled("annotation")) return;
         log.debug("annotation", event, context.get(), result, reason, () -> PlaytestLog.fields("annotation", id, "revision", revision, "stage", "storage_admission"));
     }
-    public static void archive(PlaytestLog log, boolean published, long revision, int bytes) {
+    public static void archive(PlaytestLog log, String dimension, int shardX, int shardZ, boolean published, long revision, int bytes) {
         if (!log.enabled("persistence")) return;
-        log.event("persistence", "shard.publish", "server", published ? "published" : "superseded", published ? "archive_publication_confirmed" : "older_snapshot_not_published", () -> PlaytestLog.fields("revision", revision, "bytes", bytes, "stage", published ? "atomic_archive_publication" : "publication_skipped"));
+        // Immutable native shard components only. The publisher may be asynchronous: no world/tick lookup.
+        log.debug("persistence", "shard.publish", PlaytestLog.Context.server(dimension, -1), published ? "published" : "superseded", published ? "archive_publication_confirmed" : "older_snapshot_not_published", () -> PlaytestLog.fields("shard_x", shardX, "shard_z", shardZ, "revision", revision, "bytes", bytes, "stage", published ? "atomic_archive_publication" : "publication_skipped"));
     }
     public static void decision(PlaytestLog log, String category, String event, String result, String reason) {
         if (!log.enabled(category)) return;

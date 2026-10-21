@@ -21,15 +21,15 @@ final class FeatureObservationTest {
         var nativeRng = new Random(41); var baselineRng = new Random(41);
         FeatureObservation.annotation(log, ctx, "annotation.create", "admitted", "storage_accepted", id, 2);
         FeatureObservation.annotation(log, ctx, "annotation.update", "rejected", "permission", id, 2);
-        FeatureObservation.archive(log, true, 7, 128);
-        FeatureObservation.archive(log, false, 6, 128);
+        FeatureObservation.archive(log, "minecraft:overworld", 3, -2, true, 7, 128);
+        FeatureObservation.archive(log, "minecraft:the_nether", 3, -2, false, 7, 128);
         assertTrue(records.isEmpty()); assertEquals(0, contextReads.get());
         assertArrayEquals(before, state); assertEquals(baselineRng.nextLong(), nativeRng.nextLong());
         enabled[0] = true;
         FeatureObservation.annotation(log, ctx, "annotation.create", "admitted", "storage_accepted", id, 2);
         FeatureObservation.annotation(log, ctx, "annotation.update", "rejected", "permission", id, 2);
-        FeatureObservation.archive(log, true, 7, 128);
-        FeatureObservation.archive(log, false, 6, 128);
+        FeatureObservation.archive(log, "minecraft:overworld", 3, -2, true, 7, 128);
+        FeatureObservation.archive(log, "minecraft:the_nether", 3, -2, false, 7, 128);
         assertEquals(4, records.size());
         assertTrue(records.get(0).contains("result=admitted reason=storage_accepted"), records.toString());
         assertTrue(records.get(1).contains("result=rejected reason=permission"), records.toString());
@@ -41,6 +41,12 @@ final class FeatureObservationTest {
         assertTrue(records.stream().noneMatch(s -> s.contains("durable=true")), records.toString());
         assertTrue(records.get(0).contains("stage=storage_admission"));
         assertTrue(records.get(2).contains("stage=atomic_archive_publication"));
+        assertTrue(records.get(2).contains("dimension=minecraft:overworld"));
+        assertTrue(records.get(3).contains("dimension=minecraft:the_nether"));
+        assertTrue(records.get(2).contains("shard_x=3 shard_z=-2 revision=7"));
+        assertTrue(records.get(3).contains("shard_x=3 shard_z=-2 revision=7"));
+        assertFalse(records.get(2).contains(" tick="), "async publication must not read a world clock");
+        assertTrue(records.stream().noneMatch(s -> s.contains("path=") || s.contains("worldRoot=") || s.contains("shard=TraceShardId")));
         assertFalse(records.get(3).contains("stage=atomic_archive_publication"));
         assertArrayEquals(before, state); assertEquals(baselineRng.nextLong(), nativeRng.nextLong());
     }

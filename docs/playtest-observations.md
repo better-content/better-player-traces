@@ -6,7 +6,7 @@ This repository owns the observations at `AnnotationService and TraceStorageMana
 behavior owner; the local full gate tests native behavior. Logging source/privacy contracts
 are not pack runtime, performance or visual acceptance.
 
-Existing annotation ID/revision identifies create/update/delete storage admission versus permission/capacity/missing rejection. Annotation admission is not durable archive publication. shard.publish occurs only after TraceArchive.publish returns; actual existing failure stacks stay visible. No annotation text, icon content, author UUID, echo clip or filesystem path is logged. Shard records omit precise shard location, so same-revision concurrent shards are not uniquely correlated by this summary.
+Existing annotation ID/revision identifies create/update/delete storage admission versus permission/capacity/missing rejection. Annotation admission is not durable archive publication. shard.publish occurs only after TraceArchive.publish returns; actual existing failure stacks stay visible. No annotation text, icon content, author UUID, echo clip or filesystem path is logged. Shard publication now includes only the existing immutable TraceShardId dimension registry ID and integer regionX/regionZ, alongside revision/bytes. These native shard coordinates distinguish same-revision publications across shards/worlds; they are not owner names, annotation positions, paths, or hashes of private content. The publisher may be asynchronous, so it never reads a world/player/clock for this record; unknown tick stays omitted. Only scalar components are projected after the enabled guard. This correlation followup needs a new full gate and does not relabel older qualified provider receipts.
 
 ## Controls, bounds and lifecycle
 

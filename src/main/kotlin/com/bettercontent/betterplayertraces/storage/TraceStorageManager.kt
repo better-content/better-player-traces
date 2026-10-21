@@ -830,7 +830,7 @@ class TraceStorageManager(
         val published = TraceArchive.publish(path, payload, snapshot.archiveRevision())
         val diagnostics = com.bettercontent.betterplayertraces.diagnostics.RuntimeDiagnostics.LOG
         if (diagnostics.enabled("persistence")) com.bettercontent.betterplayertraces.diagnostics.FeatureObservation.archive(
-            diagnostics, published, snapshot.archiveRevision(), payload.size)
+            diagnostics, id.dimension, id.regionX, id.regionZ, published, snapshot.archiveRevision(), payload.size)
     }
 
     fun tickFlush() {

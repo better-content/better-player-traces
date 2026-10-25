@@ -25,6 +25,7 @@ import net.minecraft.nbt.CompoundTag
 import net.minecraft.server.level.ServerPlayer
 import net.minecraft.resources.ResourceLocation
 import net.minecraft.world.level.block.Blocks
+import net.minecraft.world.level.levelgen.FlatLevelSource
 import net.minecraftforge.gametest.GameTestHolder
 import net.minecraftforge.common.MinecraftForge
 import net.minecraftforge.eventbus.api.SubscribeEvent
@@ -58,6 +59,8 @@ object TraceGametestProbe {
     @JvmStatic
     fun persistenceSurvivesRestart(helper: GameTestHelper) {
         val level = helper.level
+        helper.assertTrue(level.chunkSource.generator is FlatLevelSource,
+            "native trace fixtures must use flat terrain, not clear naturally generated block entities")
         val config = TracesConfig.common
         val traceId = UUID.randomUUID()
         val source = UUID.randomUUID()

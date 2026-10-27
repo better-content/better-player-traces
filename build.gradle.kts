@@ -293,8 +293,8 @@ val verifyNativeDiagnostics by tasks.registering {
         val log = nativeRunDirectory.resolve("logs/latest.log")
         check(log.isFile) { "Missing current native diagnostics: $log" }
         val text = log.readText()
-        check(text.contains("All 11 required tests passed") && text.contains("11 GAME TESTS COMPLETE")) {
-            "Missing eleven-test native completion: $log"
+        check(text.contains("All 12 required tests passed") && text.contains("12 GAME TESTS COMPLETE")) {
+            "Missing twelve-test native completion: $log"
         }
         val errors = text.lineSequence().filter { line ->
             listOf("/ERROR]", "/FATAL]", "[ERROR]", "[FATAL]", "Mixin apply failed").any(line::contains)

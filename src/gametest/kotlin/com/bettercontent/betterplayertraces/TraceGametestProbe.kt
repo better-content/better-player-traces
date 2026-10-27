@@ -43,6 +43,49 @@ object TraceGametestProbe {
         }
     }
 
+    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 200)
+    @JvmStatic
+    fun footTrafficProbeIsReadOnly(helper: GameTestHelper) {
+        val level = helper.level
+        val storage = TracesMod.getRuntime(level.server).storage(level)
+        val query = com.bettercontent.betterplayertraces.logic.TraceQueryService()
+        // An isolated shard keeps local/regional totals exact; server total includes any other fixtures.
+        val origin = BlockPos(100_096, 64, 100_096)
+        val baseline = query.trafficPotential(level, origin)
+        helper.assertTrue(baseline.traceCount == 0 && baseline.regionalSurvivingStrength == 0f, "fixture shard must be empty")
+        val positions = listOf(origin, origin.offset(100, 0, 0), origin.offset(512, 0, 0))
+        val traces = positions.mapIndexed { i, pos ->
+            FootTrace(UUID.randomUUID(), level.dimension().location().toString(), pos, MovementClass.WALK,
+                (i + 1).toFloat(), UUID.randomUUID(), 0, 1, 1, true, UUID.randomUUID(),
+                support = TraceSupport(pos.below(), ResourceLocation("minecraft", "stone")))
+        }
+        traces.forEach { helper.assertTrue(storage.addFootTrace(it), "fixture trace accepted") }
+        val before = positions.map { storage.traceTileSnapshot(it.x shr 4, it.z shr 4) }
+        val potential = query.trafficPotential(level, origin)
+        helper.assertTrue(potential.traceCount == 1 && potential.aliveCount == 1 && potential.sequenceCount == 1, "exact local counts")
+        helper.assertTrue(potential.localSurvivingStrength == 1f && potential.regionalSurvivingStrength == 3f, "local and regional strength")
+        helper.assertTrue(potential.serverSurvivingStrength == baseline.serverSurvivingStrength + 6f, "server strength includes remote shard")
+        helper.assertTrue(potential.serverShare == 1f / potential.serverSurvivingStrength && potential.regionalShare == 3f / potential.serverSurvivingStrength, "shares use server denominator")
+        val reports = mutableListOf<String>()
+        val player = object : ServerPlayer(level.server, level, GameProfile(UUID.randomUUID(), "probe-reader")) {
+            override fun displayClientMessage(component: net.minecraft.network.chat.Component, actionBar: Boolean) {
+                reports += component.string
+            }
+        }
+        player.setPos(origin.x.toDouble(), origin.y.toDouble(), origin.z.toDouble())
+        val stack = net.minecraft.world.item.ItemStack(com.bettercontent.betterplayertraces.item.TracesItems.PROBE_ITEM.get())
+        stack.orCreateTag.putString("sentinel", "unchanged")
+        player.setItemInHand(net.minecraft.world.InteractionHand.MAIN_HAND, stack)
+        val savedStack = stack.copy()
+        val result = stack.item.use(level, player, net.minecraft.world.InteractionHand.MAIN_HAND)
+        helper.assertTrue(result.result.consumesAction() && result.`object` === stack, "probe returns the same held stack")
+        helper.assertTrue(net.minecraft.world.item.ItemStack.matches(stack, savedStack), "probe must not consume or alter its stack")
+        helper.assertTrue(reports.size == 1 && reports.single().contains("local=1.0, region=3.0, server=${potential.serverSurvivingStrength}"), "actual item reports query totals")
+        helper.assertTrue(query.trafficPotential(level, origin) == potential, "query and probe must not alter totals")
+        helper.assertTrue(positions.map { storage.traceTileSnapshot(it.x shr 4, it.z shr 4) } == before, "query and probe must not mutate shard records/revisions")
+        helper.succeed()
+    }
+
     private fun validEchoClip(): ByteArray = EchoClipCodec.encodeQuantized(
         EchoClip(
             EchoEncoding.BONE,

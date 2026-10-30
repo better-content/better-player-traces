@@ -26,9 +26,9 @@ internal fun nextTraceTileWireRevision(lastSent: Long?, previousStorageRevision:
 
 object TracesNetwork {
     private val logger = LogUtils.getLogger()
-    private const val PROTOCOL = "better_player_traces_v8"
+    internal const val PROTOCOL = "better_player_traces_v9"
     private const val MAX_TILE_SNAPSHOTS_PER_POLL = 64
-    private const val TILE_PAGE_SIZE = 1024
+    private const val TILE_PAGE_SIZE = 512 // Leaves room for the worst-case per-page owner dictionary.
     private val nextSubscriptionGeneration = AtomicLong(1L)
     private val subscriptions = ConcurrentHashMap<UUID, ServerTraceSubscription>()
     private val loginGameTimes = ConcurrentHashMap<UUID, Long>()
@@ -165,7 +165,7 @@ object TracesNetwork {
                     msg.revision,
                     msg.pageIndex,
                     msg.pageCount,
-                    msg.traces,
+                    msg.traces.map { it.copy(own = it.owner != null && it.owner.id == net.minecraft.client.Minecraft.getInstance().player?.uuid) },
                 )
             } }
         }
@@ -432,7 +432,17 @@ object TracesNetwork {
                     subscription.sentCleanupCounts[tile], cleanupCount,
                 )
                 if (subscription.sentRevisions[tile] == revision) return@forEach
-                val traces = storage.queryTraceTile(tile.chunkX, tile.chunkZ).map(::visibleTrace)
+                val owners = HashMap<UUID, com.bettercontent.betterplayertraces.dto.TraceOwner>()
+                val traces = storage.queryTraceTile(tile.chunkX, tile.chunkZ).map { trace ->
+                    val owner = owners.getOrPut(trace.sourcePlayerInternal) {
+                        val id = trace.sourcePlayerInternal
+                        val name = (level.server.playerList.getPlayer(id)?.gameProfile?.name
+                            ?: level.server.profileCache?.get(id)?.orElse(null)?.name)
+                            ?.takeIf { it.matches(Regex("[A-Za-z0-9_]{1,16}")) }
+                        com.bettercontent.betterplayertraces.dto.TraceOwner(id, name)
+                    }
+                    visibleTrace(trace).copy(owner = owner)
+                }
                 if (traces.isNotEmpty() && recordCount > 0 && recordCount + traces.size > recordBudget) return@forEach
                 val pages = traces.chunked(TILE_PAGE_SIZE).ifEmpty { listOf(emptyList()) }
                 pages.forEachIndexed { pageIndex, page ->

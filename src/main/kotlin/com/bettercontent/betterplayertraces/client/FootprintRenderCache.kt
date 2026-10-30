@@ -74,6 +74,9 @@ object FootprintRenderCache {
         publish(started)
     }
 
+    internal fun localFootprints(level: Level, traces: List<VisibleTraceDto>): List<CachedFootprint> =
+        resolve(level, traces.filter { it.strength > 0f })
+
     private fun resolve(level: Level, traces: List<VisibleTraceDto>): List<CachedFootprint> =
         TraceVisualModel.marks(
             traces,

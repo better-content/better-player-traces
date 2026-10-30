@@ -30,6 +30,9 @@ object TracesClientKeyBindings {
         event.registerBelowAll("trace_sight") { _, graphics, _, width, height ->
             TraceSightOverlayRenderer.render(graphics, width, height)
         }
+        event.registerAboveAll("trace_owner") { _, graphics, _, width, height ->
+            TraceObservations.render(graphics, width, height)
+        }
     }
 
 }
@@ -108,6 +111,7 @@ object TracesClientHandlers {
         TraceSightOverlayRenderer.updateTarget(
             TracesClientState.overlayEnabled && mc.level != null && mc.player != null && mc.screen == null,
         )
+        TraceObservations.tick()
         val player = mc.player ?: return
         if (cooldown > 0) {
             cooldown--
@@ -129,6 +133,8 @@ object TracesClientHandlers {
     @JvmStatic
     fun onLogout(_event: ClientPlayerNetworkEvent.LoggingOut) {
         TracesClientState.clearTraceTiles()
+        TraceObservations.reset()
+        cooldown = 0
     }
 
     @SubscribeEvent

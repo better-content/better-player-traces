@@ -6,12 +6,12 @@ modId="better_player_traces"
 version="0.1.0"
 displayName="Better Player Traces"
 authors="Better Content"
-description='''Server-authoritative player movement trace system with anonymous sharing and trace-guided wayfinding.''' 
+description='''Server-authoritative player movement traces and trace-guided wayfinding. Nearby hints are anonymous; inspected footprints identify their recorded creator.'''
 
 [[dependencies.better_player_traces]]
 modId="forge"
 mandatory=true
-versionRange="[47.4.13,)"
+versionRange="[47.4.22,)"
 ordering="NONE"
 side="BOTH"
 
@@ -29,6 +29,13 @@ versionRange="[4.12.0,)"
 ordering="NONE"
 side="BOTH"
 
+
+[[dependencies.better_player_traces]]
+modId="better_gameplay_notices"
+mandatory=true
+versionRange="[1.0.0,)"
+ordering="AFTER"
+side="BOTH"
 
 [[dependencies.better_player_traces]]
 modId="quark"

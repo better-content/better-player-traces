@@ -4,5 +4,10 @@
   "key.traces.annotation": "Create or Edit Trace Note",
   "message.traces.enabled": "Trace sight enabled • N: create/edit note",
   "message.traces.disabled": "Trace sight disabled",
+  "message.traces.nearby": "Someone has passed this way",
+  "message.traces.nearby_hint": "Press %s to reveal their traces",
+  "message.traces.owner": "%s’s traces",
+  "message.traces.owner_self": "Your traces",
+  "message.traces.owner_unknown": "Unknown player’s traces",
   "item.traces.foot_traffic_probe": "Foot Traffic Probe"
 }

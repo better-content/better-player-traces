@@ -6,9 +6,11 @@ plugins {
 }
 
 val minecraftVersion = "1.20.1"
-val forgeVersion = "47.4.13"
+val forgeVersion = "47.4.22" // Shared gameplay-notices provider's supported Forge baseline.
 val visualValidationRun = providers.gradleProperty("tracesVisual").orNull == "true"
 val shaderCompatibilityValidation = providers.gradleProperty("tracesShaderCompat").orNull == "true"
+val observationFixture = providers.gradleProperty("tracesObservationFixture").orNull == "true"
+val observationRunDir = providers.gradleProperty("tracesRunDir").orNull
 val echoPrototypeEnabled = providers.gradleProperty("tracesModCacheDir").isPresent
 
 base {
@@ -37,8 +39,21 @@ repositories {
     }
 }
 
+fun betterContentJar(repository: String, artifact: String): java.io.File {
+    val directory = providers.environmentVariable("BC_CUSTOM_MOD_JAR_DIR").orNull
+    require(directory == null || directory.isNotBlank()) { "BC_CUSTOM_MOD_JAR_DIR must not be blank" }
+    val jar = if (directory == null) file("../$repository/build/libs/$artifact") else file(directory).resolve(artifact)
+    require(jar.isFile) { "Missing Better Content provider $artifact at $jar; build $repository first or set BC_CUSTOM_MOD_JAR_DIR" }
+    return jar
+}
+
+val gameplayNoticesJar = files(betterContentJar("better-gameplay-notices", "better-gameplay-notices-1.0.0.jar"))
+
 dependencies {
     minecraft("net.minecraftforge:forge:${minecraftVersion}-${forgeVersion}")
+    compileOnly(gameplayNoticesJar)
+    runtimeOnly(gameplayNoticesJar)
+    testImplementation(gameplayNoticesJar)
     implementation("thedarkcolour:kotlinforforge:4.12.0")
     compileOnly(fg.deobf("curse.maven:quark-243121:6427817"))
     compileOnly(fg.deobf("curse.maven:zeta-968868:7335229"))
@@ -101,7 +116,12 @@ minecraft {
 
     runs {
         val baseClient = create("client") {
-            workingDirectory(project.file(if (visualValidationRun) "build/visual-run" else "run"))
+            workingDirectory(project.file(observationRunDir ?: if (visualValidationRun) "build/visual-run" else "run"))
+            if (observationFixture) {
+                property("traces.observationFixture", "true")
+                jvmArgs("-Xmx2G", "-XX:ActiveProcessorCount=2")
+                args("--quickPlayMultiplayer", "127.0.0.1:${providers.gradleProperty("tracesFixturePort").getOrElse("25585")}", "--width", "1280", "--height", "720")
+            }
             if (visualValidationRun) {
                 args("--quickPlaySingleplayer", "Traces Visual", "--width", "1280", "--height", "720")
                 property("traces.visualValidation", "true")
@@ -137,7 +157,11 @@ minecraft {
         }
 
         create("server") {
-            workingDirectory(project.file("run"))
+            workingDirectory(project.file(observationRunDir ?: "run"))
+            if (observationFixture) {
+                property("traces.observationFixture", "true")
+                jvmArgs("-Xmx2G", "-XX:ActiveProcessorCount=2")
+            }
             args("--nogui")
             property("forge.logging.markers", "REGISTRIES")
             property("forge.logging.console.level", "debug")

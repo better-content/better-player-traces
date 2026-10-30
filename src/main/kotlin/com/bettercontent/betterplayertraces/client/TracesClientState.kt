@@ -52,8 +52,30 @@ object TracesClientState {
     @Volatile
     var sessionLoginGameTime: Long = 0L
 
-    fun beginTraceSubscription(generation: Long, dimension: String, loginGameTime: Long) {
-        if (generation < traceGeneration) return
+    var observationEpoch: Long = 0L
+        private set
+    private var subscriptionConfirmedAt: Long = Long.MIN_VALUE
+
+    fun subscriptionFresh(dimension: String, now: Long = net.minecraft.Util.getMillis()): Boolean =
+        traceTileMode && dimension == traceDimension && subscriptionConfirmedAt != Long.MIN_VALUE &&
+            now - subscriptionConfirmedAt in 0L..10_000L
+
+    fun nearbyTraces(x: Double, z: Double, radius: Double): List<VisibleTraceDto> {
+        val minX = kotlin.math.floor((x - radius) / 16).toInt()
+        val maxX = kotlin.math.floor((x + radius) / 16).toInt()
+        val minZ = kotlin.math.floor((z - radius) / 16).toInt()
+        val maxZ = kotlin.math.floor((z + radius) / 16).toInt()
+        return buildList {
+            for (cx in minX..maxX) for (cz in minZ..maxZ) {
+                traceTiles[TraceTileKey(cx, cz)]?.traces?.forEach {
+                    if (kotlin.math.abs(it.x - x) <= radius && kotlin.math.abs(it.z - z) <= radius) add(it)
+                }
+            }
+        }
+    }
+
+    fun beginTraceSubscription(generation: Long, dimension: String, loginGameTime: Long, nowMillis: Long = net.minecraft.Util.getMillis()): Boolean {
+        if (generation < traceGeneration || (generation == traceGeneration && dimension != traceDimension)) return false
         if (generation > traceGeneration) {
             pendingTraceTiles.clear()
             if (traceGeneration != Long.MIN_VALUE) {
@@ -62,11 +84,14 @@ object TracesClientState {
                 footprintPayloadRevision++
             }
             traceGeneration = generation
+            observationEpoch++
         }
+        subscriptionConfirmedAt = nowMillis
         traceDimension = dimension
         sessionLoginGameTime = loginGameTime
         traceTileMode = true
         lastPayloadTraceCount = traceTiles.values.sumOf { it.traces.size }
+        return true
     }
 
     fun acceptTraceTilePage(
@@ -80,7 +105,8 @@ object TracesClientState {
     ): Boolean {
         if (pageCount !in 1..MAX_TILE_PAGES || pageIndex !in 0 until pageCount || revision < 0L) return false
         if (generation < traceGeneration) return false
-        if (generation > traceGeneration || dimension != traceDimension) {
+        if (generation == traceGeneration && dimension != traceDimension) return false
+        if (generation > traceGeneration) {
             beginTraceSubscription(generation, dimension, sessionLoginGameTime)
         }
         if (generation != traceGeneration || dimension != traceDimension) return false
@@ -119,12 +145,17 @@ object TracesClientState {
             }
         }
         if (changed) {
+            observationEpoch++
             footprintPayloadRevision++
             lastPayloadTraceCount = traceTiles.values.sumOf { it.traces.size }
         }
     }
 
     fun clearTraceTiles() {
+        observationEpoch++
+        subscriptionConfirmedAt = Long.MIN_VALUE
+        hasResponse = false
+        lastPayloadAtMillis = 0L
         traces.clear()
         traceTiles.clear()
         pendingTraceTiles.clear()

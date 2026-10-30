@@ -1,0 +1,43 @@
+// Nonshipping: export ForgeGradle's prepared JavaExec commands so a disposable dedicated server
+// and real client can run concurrently without holding the same project's Gradle task lock.
+import groovy.json.JsonOutput
+
+gradle.projectsEvaluated {
+    def project = gradle.rootProject
+    def root = project.providers.gradleProperty('tracesFixtureRoot').get()
+    project.tasks.matching { it.name == 'runServer' }.configureEach { workingDir(new File(root, 'server')) }
+    project.tasks.matching { it.name == 'runClient' }.configureEach { workingDir(new File(root, 'client')) }
+    project.tasks.register('exportObservationLaunches') {
+        dependsOn('prepareRunServer', 'prepareRunClient', 'prepareRunServerCompile', 'prepareRunClientCompile')
+        doLast {
+            def specs = [:]
+            ['runServer', 'runClient'].each { name ->
+                def launch = project.tasks.named(name).get()
+                // ForgeGradle materializes tokens inside MinecraftRunTask.exec(), not at configuration.
+                // Use its pinned generator implementation rather than hand-assembling module paths.
+                def config = launch.runConfig.get()
+                def generator = config.class.classLoader.loadClass('net.minecraftforge.gradle.common.util.runs.RunConfigGenerator')
+                def tokens = generator.configureTokensLazy(project, config, generator.mapModClassesToGradle(project, config),
+                        launch.minecraftArtifacts, launch.runtimeClasspathArtifacts)
+                launch.args(generator.getArgsStream(config, tokens, false).toArray())
+                config.jvmArgs.each { launch.jvmArgs(config.replace(tokens, it)) }
+                if (config.client) launch.additionalClientArgs.get().each { launch.jvmArgs(config.replace(tokens, it)) }
+                config.environment.each { key, value -> launch.environment(key, config.replace(tokens, value)) }
+                config.properties.each { key, value -> launch.systemProperty(key, config.replace(tokens, value)) }
+                config.allSources.each { launch.classpath(it.runtimeClasspath) }
+                def java = launch.javaLauncher.get().executablePath.asFile.absolutePath
+                def providedJvmArgs = launch.jvmArgumentProviders.collectMany { it.asArguments().toList() }
+                def command = [java] + launch.jvmArgs + launch.allJvmArgs + providedJvmArgs + ['-cp', launch.classpath.asPath, launch.mainClass.get()] + launch.args
+                assert command.contains('-Xmx2G') : 'missing native memory bound'
+                assert command.any { it.contains('java.lang.invoke=cpw.mods.securejarhandler') } : 'missing Forge module opens'
+                def environment = launch.environment.collectEntries { key, value -> [(key.toString()): value.toString()] }
+                assert environment['MOD_CLASSES']?.contains('better_player_traces') : 'missing Forge source-set bindings'
+                specs[name] = [command: command, cwd: launch.workingDir.absolutePath, environment: environment]
+            }
+            def output = new File(root, 'launches.json')
+            output.parentFile.mkdirs()
+            output.text = JsonOutput.prettyPrint(JsonOutput.toJson(specs)) + '\n'
+            println "Observation launches exported to ${output}"
+        }
+    }
+}

@@ -282,8 +282,22 @@ data class TraceTileSnapshotPacket(
         require(traces.size <= MAX_TRACE_TILE_PAGE_RECORDS) { "trace tile page exceeds protocol limit" }
         buf.writeVarLong(generation); buf.writeUtf(dimension, 256)
         buf.writeInt(chunkX); buf.writeInt(chunkZ); buf.writeVarLong(revision)
-        buf.writeVarInt(pageIndex); buf.writeVarInt(pageCount); buf.writeVarInt(traces.size)
-        traces.forEach { writeVisibleTrace(buf, it) }
+        buf.writeVarInt(pageIndex); buf.writeVarInt(pageCount)
+        val owners = traces.mapNotNull { it.owner }.distinctBy { it.id }
+        require(owners.size <= MAX_TRACE_TILE_PAGE_RECORDS)
+        require(traces.all { trace -> trace.owner == null || owners.any { it == trace.owner } }) { "conflicting trace owner entries" }
+        buf.writeVarInt(owners.size)
+        owners.forEach { owner ->
+            buf.writeUUID(owner.id)
+            buf.writeBoolean(owner.name != null)
+            owner.name?.let { buf.writeUtf(it, 16) }
+        }
+        val references = owners.mapIndexed { index, owner -> owner.id to index + 1 }.toMap()
+        buf.writeVarInt(traces.size)
+        traces.forEach {
+            buf.writeVarInt(it.owner?.let { owner -> references.getValue(owner.id) } ?: 0)
+            writeVisibleTrace(buf, it)
+        }
     }
 
     companion object {
@@ -294,12 +308,23 @@ data class TraceTileSnapshotPacket(
             val revision = buf.readVarLong().also { require(it >= 0L) { "trace tile revision is invalid" } }
             val pageIndex = buf.readVarInt(); val pageCount = buf.readVarInt()
             require(pageCount in 1..4096 && pageIndex in 0 until pageCount) { "trace tile page is invalid" }
+            val ownerCount = buf.readVarInt()
+            require(ownerCount in 0..MAX_TRACE_TILE_PAGE_RECORDS) { "trace owner dictionary is too large" }
+            val owners = List(ownerCount) {
+                com.bettercontent.betterplayertraces.dto.TraceOwner(buf.readUUID(), if (buf.readBoolean()) buf.readUtf(16) else null)
+            }
+            require(owners.map { it.id }.distinct().size == owners.size) { "duplicate trace owner" }
             val count = buf.readVarInt()
-            require(count in 0..MAX_TRACE_TILE_PAGE_RECORDS) { "trace tile record count is invalid" }
-            return TraceTileSnapshotPacket(
-                generation, dimension, chunkX, chunkZ, revision, pageIndex, pageCount,
-                List(count) { readVisibleTrace(buf) },
-            )
+            require(count in 0..MAX_TRACE_TILE_PAGE_RECORDS && ownerCount <= count) { "trace tile record count is invalid" }
+            val used = HashSet<Int>()
+            val traces = List(count) {
+                val reference = buf.readVarInt()
+                require(reference in 0..ownerCount) { "invalid trace owner reference" }
+                if (reference > 0) used += reference
+                readVisibleTrace(buf).copy(owner = if (reference == 0) null else owners[reference - 1])
+            }
+            require(used.size == ownerCount) { "unrelated trace owner dictionary entry" }
+            return TraceTileSnapshotPacket(generation, dimension, chunkX, chunkZ, revision, pageIndex, pageCount, traces)
         }
     }
 }

@@ -47,7 +47,7 @@ fun betterContentJar(repository: String, artifact: String): java.io.File {
     return jar
 }
 
-val gameplayNoticesJar = files(betterContentJar("better-gameplay-notices", "better-gameplay-notices-1.0.0.jar"))
+val gameplayNoticesJar = files(betterContentJar("better-gameplay-notices", "better-gameplay-notices-1.0.1.jar"))
 
 dependencies {
     minecraft("net.minecraftforge:forge:${minecraftVersion}-${forgeVersion}")

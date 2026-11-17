@@ -262,6 +262,43 @@ object TraceGametestProbe {
         }
     }
 
+    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 200)
+    @JvmStatic
+    fun loadedSupportLossPhysicallyErasesWithoutRenumbering(helper: GameTestHelper) {
+        val level = helper.level
+        val storage = TraceStorageManager(level, TracesConfig.common)
+        val erosion = ErosionService(storage, TracesConfig.common)
+        val firstPos = helper.absolutePos(BlockPos(3, 2, 3))
+        val secondPos = firstPos.east()
+        val sequence = UUID.randomUUID()
+        val supportBlock = ResourceLocation("minecraft", "stone")
+        fun footprint(position: BlockPos, index: Int) = FootTrace(
+            UUID.randomUUID(), level.dimension().location().toString(), position, MovementClass.WALK,
+            1f, sequence, index, 1, 1, true, UUID.randomUUID(),
+            support = TraceSupport(position.below(), supportBlock),
+        )
+        val removed = footprint(firstPos, 0)
+        val survivor = footprint(secondPos, 2)
+        try {
+            level.setBlockAndUpdate(firstPos.below(), Blocks.STONE.defaultBlockState())
+            level.setBlockAndUpdate(secondPos.below(), Blocks.STONE.defaultBlockState())
+            helper.assertTrue(level.chunkSource.getChunkNow(firstPos.x shr 4, firstPos.z shr 4) != null,
+                "maintenance fixture must be in an already-loaded chunk")
+            helper.assertTrue(storage.addFootTrace(removed) && storage.addFootTrace(survivor), "fixture accepted")
+            erosion.onChunkLoaded(firstPos.x shr 4, firstPos.z shr 4)
+            level.setBlockAndUpdate(firstPos.below(), Blocks.AIR.defaultBlockState())
+            erosion.tick(level, 1)
+            val remaining = storage.queryTraces(firstPos, secondPos)
+            helper.assertTrue(remaining.map { it.id } == listOf(survivor.id),
+                "loaded support loss must remove the first record from all live indexes")
+            helper.assertTrue(remaining.single().sequenceIndex == 2, "surviving sequence gap must remain")
+            helper.succeed()
+        } finally {
+            erosion.onChunkUnloaded(firstPos.x shr 4, firstPos.z shr 4)
+            storage.close()
+        }
+    }
+
     private fun rainFixturePosition(helper: GameTestHelper, local: BlockPos): BlockPos {
         return rainFixtureColumn(helper, helper.absolutePos(BlockPos(local.x, 0, local.z)))
     }

@@ -306,7 +306,7 @@ tasks.named("assemble") {
 }
 
 val verifyNativeSetup by tasks.registering(Exec::class) {
-    commandLine("python3", "-B", "-m", "unittest", "discover", "-s", "scripts", "-p", "test_native_properties.py")
+    commandLine("python3", "-B", "-m", "unittest", "discover", "-s", "scripts", "-p", "test_*.py")
 }
 val prepareNativeProperties by tasks.registering(Exec::class) {
     commandLine("python3", "-B", "scripts/ensure_native_properties.py", nativeRunDirectory.absolutePath)
@@ -317,8 +317,8 @@ val verifyNativeDiagnostics by tasks.registering {
         val log = nativeRunDirectory.resolve("logs/latest.log")
         check(log.isFile) { "Missing current native diagnostics: $log" }
         val text = log.readText()
-        check(text.contains("All 12 required tests passed") && text.contains("12 GAME TESTS COMPLETE")) {
-            "Missing twelve-test native completion: $log"
+        check(text.contains("All 13 required tests passed") && text.contains("13 GAME TESTS COMPLETE")) {
+            "Missing thirteen-test native completion: $log"
         }
         val errors = text.lineSequence().filter { line ->
             listOf("/ERROR]", "/FATAL]", "[ERROR]", "[FATAL]", "Mixin apply failed").any(line::contains)

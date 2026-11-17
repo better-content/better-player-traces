@@ -1,0 +1,19 @@
+{
+  "schema": "better-player-traces-isolated-suite-v1",
+  "source": "unreleased v4; not a pack or friends-world test",
+  "tiers": {
+    "source-compile": {"approval": "audited compile-only scope", "requires": ["main-source", "unit-test-source", "gametest-source", "no-test-or-archive-task"]},
+    "verifyFast": {"command": ["./gradlew", "verifyFast"], "approval": "separate explicit human approval", "requires": ["junit-jupiter", "native-property-python", "qualification-harness-python"]},
+    "verifyFull": {"command": ["./gradlew", "verifyFull"], "approval": "separate explicit human approval", "requires": ["verifyFast", "13-headless-gametests"]},
+    "fault-restart": {"approval": "separate explicit human approval", "requires": ["disposable-v4-world", "fault-point", "before-after-world-hashes", "cold-restart", "no-false-ack"]},
+    "two-client": {"approval": "separate explicit human approval", "requires": ["two-independent-processes", "client-a-log", "client-b-log", "server-log", "human-visual-review"]},
+    "performance": {"approval": "separate explicit human approval", "requires": ["two-real-clients", "six-labeled-synthetic-actors", "old-source-baseline", "no-traces-baseline", "seed-and-config-parity", "eight-actor-gates", "16-and-32-diagnostic-curves"]}
+  },
+  "eightActorGate": {
+    "warmupMinutes": 10, "steadyMinutesPerCase": 20, "healthyDurableNotesOverall": 100,
+    "heapObservationMinutes": 30, "minTps": 19, "maxTickP95Ms": 50, "maxTickP99Ms": 100,
+    "maxNoteP95Ms": 5000, "maxNoteP99Ms": 15000, "maxEachClientFrameP95Ms": 50,
+    "maxPostGcHeapGrowthMibOrFraction": [128, 0.10]
+  },
+  "nonGoals": ["full-Lineage-pack", "friends-world", "shipping-JAR", "Quark-Zeta-shaders", "echo-prototype"]
+}

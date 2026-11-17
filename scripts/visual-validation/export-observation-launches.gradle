@@ -34,6 +34,26 @@ gradle.projectsEvaluated {
                 assert environment['MOD_CLASSES']?.contains('better_player_traces') : 'missing Forge source-set bindings'
                 specs[name] = [command: command, cwd: launch.workingDir.absolutePath, environment: environment]
             }
+            if (project.providers.gradleProperty('tracesTwoClients').orNull == 'true') {
+                def cloneClient = { original, name, directory ->
+                    def command = new ArrayList(original.command)
+                    def replaceOption = { option, value ->
+                        def index = command.indexOf(option)
+                        assert index >= 0 && index + 1 < command.size() : "native client launch missing ${option}; refusing to guess"
+                        command[index + 1] = value
+                    }
+                    replaceOption('--gameDir', new File(root, directory).absolutePath)
+                    replaceOption('--username', name)
+                    // Offline accounts must be distinct; never reuse the first client's UUID.
+                    def uuidIndex = command.indexOf('--uuid')
+                    if (uuidIndex >= 0) command[uuidIndex + 1] = java.util.UUID.nameUUIDFromBytes(('OfflinePlayer:' + name).bytes).toString()
+                    [command: command, cwd: new File(root, directory).absolutePath,
+                     environment: new LinkedHashMap(original.environment)]
+                }
+                specs.runClientA = cloneClient(specs.runClient, 'TracesAlice', 'client-a')
+                specs.runClientB = cloneClient(specs.runClient, 'TracesBob', 'client-b')
+                // The old one-client spec is retained for the existing observation runner.
+            }
             def output = new File(root, 'launches.json')
             output.parentFile.mkdirs()
             output.text = JsonOutput.prettyPrint(JsonOutput.toJson(specs)) + '\n'

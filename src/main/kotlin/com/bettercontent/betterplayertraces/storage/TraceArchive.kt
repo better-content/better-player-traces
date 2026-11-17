@@ -88,6 +88,15 @@ internal object TraceArchive {
         return true
     }
 
+    /** Re-read and force the manifest directory after an ambiguous rename/fsync outcome. */
+    @Synchronized
+    fun confirmDurable(shard: Path, revision: Long): Boolean {
+        val observed = readLatest(shard)
+        if (observed.revision != revision) return false
+        forceDirectory(shard.parent)
+        return true
+    }
+
     fun readLatest(shard: Path): Snapshot {
         val primary = manifestPath(shard)
         var primaryFailure: Exception? = null

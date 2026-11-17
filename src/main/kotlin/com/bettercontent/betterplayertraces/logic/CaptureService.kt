@@ -40,6 +40,8 @@ class CaptureService(
         // Creative -> Survival change and would incorrectly suppress grounded steps.
         val suppress = player.isSwimming || player.isFallFlying || player.isSpectator
         if (suppress || !onGround) {
+            if (state.hasTrace) breakSequence(state)
+            state.lastTick = level.gameTime
             state.onGround = onGround
             state.hasTrace = false
             state.distanceSinceEmission = 0.0
@@ -53,12 +55,10 @@ class CaptureService(
         }
         state.lastTick = now
 
-        val changedDimension = player.lastPosDelta() > 8.0
+        val changedDimension = player.lastPosDelta() > MAX_SEGMENT_DISTANCE ||
+            player.position().distanceTo(state.lastPos) > MAX_SEGMENT_DISTANCE
         if (changedDimension) {
-            state.sequenceId = UUID.randomUUID()
-            state.sequenceIndex = 0
-            state.hasTrace = false
-            state.distanceSinceEmission = 0.0
+            breakSequence(state)
             state.lastPos = player.position()
             return 0
         }
@@ -95,13 +95,15 @@ class CaptureService(
             state.hasTrace = true
             state.distanceSinceEmission = 0.0
         }
-        val sampled = sampleSegment(state.lastPos, nextPos, state.distanceSinceEmission, captureSpacing(movement))
+        val sampled = sampleSegment(state.lastPos, nextPos, state.distanceSinceEmission, captureSpacing(movement), MAX_SEGMENT_POINTS - points.size)
         points += sampled.points
         state.distanceSinceEmission = sampled.distanceSinceEmission
         val yaw = player.yRot.takeIf { it.isFinite() } ?: 0f
         var emitted = 0
-        points.forEach { point ->
-            val surface = TraceSupportResolver.resolve(level, point, FOOTPRINT_SUPPORT_DEPTH) ?: return@forEach
+        var omitted = sampled.truncated
+        for (point in points) {
+            val surface = TraceSupportResolver.resolve(level, point, FOOTPRINT_SUPPORT_DEPTH)
+            if (surface == null) { omitted = true; break }
             if (storage.addFootTrace(FootTrace(
                 id = UUID.randomUUID(),
                 levelKey = level.dimension().location().toString(),
@@ -110,18 +112,26 @@ class CaptureService(
                 movementClass = movement,
                 strength = strength,
                 sequenceId = state.sequenceId,
-                sequenceIndex = state.sequenceIndex++,
+                sequenceIndex = state.sequenceIndex,
                 createdAt = now,
                 sequenceEpoch = now,
                 surviving = true,
                 sourcePlayerInternal = player.uuid,
                 support = surface.support,
-            ))) emitted++
+            ))) { state.sequenceIndex++; emitted++ }
+            else { omitted = true; break }
         }
-
+        if (omitted) breakSequence(state)
         state.lastPos = nextPos
         state.onGround = onGround
         return emitted
+    }
+
+    private fun breakSequence(state: PlayerState) {
+        state.sequenceId = UUID.randomUUID()
+        state.sequenceIndex = 0
+        state.hasTrace = false
+        state.distanceSinceEmission = 0.0
     }
 
     private fun ServerPlayer.lastPosDelta(): Double {
@@ -138,10 +148,13 @@ class CaptureService(
 
     companion object {
         private const val FOOTPRINT_SUPPORT_DEPTH = 3
-        data class SamplingResult(val points: List<Vec3>, val distanceSinceEmission: Double)
+        internal const val MAX_SEGMENT_POINTS = 16
+        internal const val MAX_SEGMENT_DISTANCE = 8.0
+        data class SamplingResult(val points: List<Vec3>, val distanceSinceEmission: Double, val truncated: Boolean = false)
 
-        internal fun sampleSegment(start: Vec3, end: Vec3, carried: Double, spacing: Double = 0.75): SamplingResult {
-            require(spacing.isFinite() && spacing > 0.0)
+        internal fun sampleSegment(start: Vec3, end: Vec3, carried: Double, spacing: Double = 0.75,
+                                   maxPoints: Int = MAX_SEGMENT_POINTS): SamplingResult {
+            require(spacing.isFinite() && spacing > 0.0 && maxPoints > 0)
             require(carried.isFinite() && carried >= 0.0 && carried < spacing)
             val dx = end.x - start.x
             val dz = end.z - start.z
@@ -150,6 +163,7 @@ class CaptureService(
             val points = mutableListOf<Vec3>()
             var distance = spacing - carried
             while (distance <= length + 1.0e-9) {
+                if (points.size >= maxPoints) return SamplingResult(points, 0.0, truncated = true)
                 val t = (distance / length).coerceIn(0.0, 1.0)
                 points += Vec3(start.x + (end.x - start.x) * t, start.y + (end.y - start.y) * t, start.z + (end.z - start.z) * t)
                 distance += spacing

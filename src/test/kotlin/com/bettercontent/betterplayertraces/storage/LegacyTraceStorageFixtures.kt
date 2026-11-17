@@ -76,12 +76,6 @@ internal fun overlayCleanupRevision(baseRevision: Long, pendingCleanups: Int): L
     else baseRevision + pendingCleanups
 }
 
-internal fun shouldPruneInvalidSupport(
-    support: TraceSupport,
-    isChunkLoaded: (BlockPos) -> Boolean,
-    isValid: (TraceSupport) -> Boolean,
-): Boolean = isChunkLoaded(support.position) && !isValid(support)
-
 internal fun ensureTraceSchema(tracesRoot: Path) {
     val schemaFile = tracesRoot.resolve("schema")
     Files.createDirectories(schemaFile.parent)
@@ -99,7 +93,8 @@ internal fun ensureTraceSchema(tracesRoot: Path) {
     }
 }
 
-class TraceStorageManager(
+/** Pre-redesign fixture implementation retained only for legacy safety assertions; production uses TraceLiveStorage.kt. */
+internal class LegacyTraceStorageManager(
     private val level: ServerLevel,
     private val config: TracesConfig.Common,
 ) {
@@ -588,17 +583,17 @@ class TraceStorageManager(
     private fun applySeen(shardId: TraceShardId, shard: TraceShardState, record: SeenStateRecord) {
         if (shard.annotationById(record.annotationId) == null) return
         synchronized(shard) {
-            val index = shard.seenStates.indexOfFirst {
-                it.playerId == record.playerId && it.annotationId == record.annotationId
-            }
-            if (index >= 0) {
-                if (record.highestRevision > shard.seenStates[index].highestRevision) {
-                    shard.seenStates[index] = record
+            val existing = shard.seenStates.byKey(record.annotationId, record.playerId)
+            if (existing != null) {
+                if (record.highestRevision > existing.highestRevision) {
+                    shard.seenStates.replace(record)
+                    shard.indexSeen(record)
                     shard.markDirty()
                     markDirty(shardId)
                 }
             } else {
                 shard.seenStates += record
+                shard.indexSeen(record)
                 shard.markDirty()
                 markDirty(shardId)
             }
@@ -1101,12 +1096,6 @@ class TraceStorageManager(
     }
 }
 
-internal data class SeenStateRecord(
-    val annotationId: UUID,
-    val playerId: UUID,
-    val highestRevision: Int,
-)
-
 internal data class DeferredSeenState(
     val shardId: TraceShardId,
     val record: SeenStateRecord,
@@ -1166,24 +1155,6 @@ private data class AnnotationKey(val annotationId: UUID)
  * Holds an evicted snapshot until it is either reclaimed by a cache miss or durably written.
  * Identity-aware completion prevents an older queued writer from deleting a newer eviction.
  */
-internal data class StorageOutageFrontier(
-    val rejectedCaptures: Long,
-    val rejectedAnnotations: Long,
-    val affectedShards: Set<TraceShardId>,
-    val deferredByKind: Map<Kind, Long> = emptyMap(),
-) {
-    enum class Kind { CAPTURE, ANNOTATION, EVENT_REMOVAL, EROSION, SEEN_STATE, READ }
-}
-
-/** Text for operators; counters remain process-local, accepted mutations are journaled durably. */
-internal object StorageOutageStatus {
-    fun format(frontier: StorageOutageFrontier): String =
-            "storage outage frontier: rejected captures=${frontier.rejectedCaptures} " +
-            "annotations=${frontier.rejectedAnnotations} affected regions=${frontier.affectedShards.size} " +
-            "deferred=${frontier.deferredByKind.entries.sortedBy { it.key.name }.joinToString(",") { "${it.key.name.lowercase()}=${it.value}" }} " +
-            "accepted deferred mutations durably journaled; diagnostic counters are memory-only"
-}
-
 internal class StorageBackpressureException(message: String) : IllegalStateException(message)
 
 internal enum class CaptureAdmission { RESERVED, ALREADY_QUEUED, REJECTED }

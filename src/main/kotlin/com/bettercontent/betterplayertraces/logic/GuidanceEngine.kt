@@ -38,11 +38,13 @@ object GuidanceEngine {
         val sequences = traces.asSequence()
             .filter { it.surviving }
             .groupBy { it.sequenceId }
+            .toSortedMap(compareBy(UUID::toString))
             .values
             .map { sequence ->
                 sequence.sortedWith(compareBy<FootTrace> { it.sequenceIndex }.thenBy { it.id })
                     .distinctBy { it.sequenceIndex }
             }
+            .flatMap(::contiguousRuns)
             .filter { it.size >= 2 }
             .toList()
         val candidates = annotations.filter {
@@ -63,6 +65,20 @@ object GuidanceEngine {
             acceptedPoints += route.path.size
         }
         return GuidanceBuildResult(routes.size, accepted, accepted.size != routes.size)
+    }
+
+    /** Erasure, teleport and missed support split a path; surviving indexes are never renumbered. */
+    internal fun contiguousRuns(sequence: List<FootTrace>): List<List<FootTrace>> {
+        if (sequence.isEmpty()) return emptyList()
+        val runs = mutableListOf<MutableList<FootTrace>>()
+        for (trace in sequence) {
+            val previous = runs.lastOrNull()?.lastOrNull()
+            if (previous == null || trace.sequenceIndex != previous.sequenceIndex + 1 ||
+                distanceSquared(trace.x, trace.y, trace.z, previous.x, previous.y, previous.z) >
+                    ATTACH_DISTANCE * ATTACH_DISTANCE) runs.add(mutableListOf())
+            runs.last().add(trace)
+        }
+        return runs
     }
 
     private fun bestRoute(

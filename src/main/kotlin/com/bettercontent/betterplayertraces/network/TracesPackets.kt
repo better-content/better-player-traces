@@ -283,9 +283,16 @@ data class TraceTileSnapshotPacket(
         buf.writeVarLong(generation); buf.writeUtf(dimension, 256)
         buf.writeInt(chunkX); buf.writeInt(chunkZ); buf.writeVarLong(revision)
         buf.writeVarInt(pageIndex); buf.writeVarInt(pageCount)
-        val owners = traces.mapNotNull { it.owner }.distinctBy { it.id }
+        val ownersById = linkedMapOf<java.util.UUID, com.bettercontent.betterplayertraces.dto.TraceOwner>()
+        traces.forEach { trace ->
+            trace.owner?.let { owner ->
+                val previous = ownersById[owner.id]
+                require(previous == null || previous == owner) { "conflicting trace owner entries" }
+                if (previous == null) ownersById[owner.id] = owner
+            }
+        }
+        val owners = ownersById.values.toList()
         require(owners.size <= MAX_TRACE_TILE_PAGE_RECORDS)
-        require(traces.all { trace -> trace.owner == null || owners.any { it == trace.owner } }) { "conflicting trace owner entries" }
         buf.writeVarInt(owners.size)
         owners.forEach { owner ->
             buf.writeUUID(owner.id)
@@ -349,6 +356,21 @@ data class TraceTileEvictPacket(
             val count = buf.readVarInt().also { require(it in 0..MAX_TRACE_TILE_EVICTIONS) }
             return TraceTileEvictPacket(generation, dimension, List(count) { TraceTileCoordinate(buf.readInt(), buf.readInt()) })
         }
+    }
+}
+
+data class TraceTileUnavailablePacket(
+    val generation: Long, val dimension: String, val chunkX: Int, val chunkZ: Int,
+) {
+    fun encode(buf: FriendlyByteBuf) {
+        require(generation >= 0L && dimension.length <= 256)
+        buf.writeVarLong(generation); buf.writeUtf(dimension, 256)
+        buf.writeInt(chunkX); buf.writeInt(chunkZ)
+    }
+    companion object {
+        fun decode(buf: FriendlyByteBuf): TraceTileUnavailablePacket = TraceTileUnavailablePacket(
+            buf.readVarLong().also { require(it >= 0L) }, buf.readUtf(256), buf.readInt(), buf.readInt(),
+        )
     }
 }
 
@@ -417,6 +439,8 @@ data class AnnotationCreatePacket(
     val color: Int,
     val echoMutation: EchoMutation,
     val encodedClip: ByteArray?,
+    val sessionId: UUID = UUID.randomUUID(),
+    val dimension: String = "",
 ) {
     constructor(target: Long, text: String) : this(UUID.randomUUID(), target, text, "pin", AnnotationComponents.colors.getValue("orange"), EchoMutation.KEEP, null)
 
@@ -425,6 +449,9 @@ data class AnnotationCreatePacket(
         require(icon.length <= 64) { "annotation icon exceeds protocol limit" }
         validateEchoMutation(echoMutation, encodedClip, creating = true)
         buf.writeUUID(requestId)
+        require(dimension.length <= 256)
+        buf.writeUUID(sessionId)
+        buf.writeUtf(dimension, 256)
         buf.writeLong(target)
         buf.writeUtf(text, MAX_ANNOTATION_TEXT)
         buf.writeUtf(icon, 64)
@@ -437,6 +464,8 @@ data class AnnotationCreatePacket(
     companion object {
         fun decode(buf: FriendlyByteBuf): AnnotationCreatePacket {
             val requestId = buf.readUUID()
+            val sessionId = buf.readUUID()
+            val dimension = buf.readUtf(256)
             val target = buf.readLong()
             val text = buf.readUtf(MAX_ANNOTATION_TEXT)
             val icon = buf.readUtf(64)
@@ -444,7 +473,7 @@ data class AnnotationCreatePacket(
             val mutation = readEchoMutation(buf)
             val clip = if (buf.readBoolean()) buf.readByteArray(AnnotationEchoRecord.MAX_ENCODED_BYTES) else null
             validateEchoMutation(mutation, clip, creating = true)
-            return AnnotationCreatePacket(requestId, target, text, icon, color, mutation, clip)
+            return AnnotationCreatePacket(requestId, target, text, icon, color, mutation, clip, sessionId, dimension)
         }
     }
 }
@@ -458,6 +487,8 @@ data class AnnotationUpdatePacket(
     val color: Int,
     val echoMutation: EchoMutation,
     val encodedClip: ByteArray?,
+    val sessionId: UUID = UUID.randomUUID(),
+    val dimension: String = "",
 ) {
     constructor(id: String, expectedRevision: Int, text: String) : this(
         UUID.randomUUID(), id, expectedRevision, text, "pin", AnnotationComponents.colors.getValue("orange"), EchoMutation.KEEP, null,
@@ -469,6 +500,9 @@ data class AnnotationUpdatePacket(
         require(icon.length <= 64) { "annotation icon exceeds protocol limit" }
         validateEchoMutation(echoMutation, encodedClip, creating = false)
         buf.writeUUID(requestId)
+        require(dimension.length <= 256)
+        buf.writeUUID(sessionId)
+        buf.writeUtf(dimension, 256)
         buf.writeUtf(id, 36)
         buf.writeVarInt(expectedRevision)
         buf.writeUtf(text, MAX_ANNOTATION_TEXT)
@@ -483,6 +517,8 @@ data class AnnotationUpdatePacket(
         fun decode(buf: FriendlyByteBuf): AnnotationUpdatePacket {
             try {
                 val requestId = buf.readUUID()
+                val sessionId = buf.readUUID()
+                val dimension = buf.readUtf(256)
                 val id = buf.readUtf(36)
                 val revision = buf.readVarInt()
                 require(revision >= 0) { "annotation revision is invalid" }
@@ -492,7 +528,7 @@ data class AnnotationUpdatePacket(
                 val mutation = readEchoMutation(buf)
                 val clip = if (buf.readBoolean()) buf.readByteArray(AnnotationEchoRecord.MAX_ENCODED_BYTES) else null
                 validateEchoMutation(mutation, clip, creating = false)
-                return AnnotationUpdatePacket(requestId, id, revision, text, icon, color, mutation, clip)
+                return AnnotationUpdatePacket(requestId, id, revision, text, icon, color, mutation, clip, sessionId, dimension)
             } catch (error: IndexOutOfBoundsException) {
                 throw IllegalArgumentException("annotation update packet is truncated", error)
             }
@@ -500,40 +536,63 @@ data class AnnotationUpdatePacket(
     }
 }
 
+enum class NoteWireStatus { PENDING, COMMITTED, REJECTED, INDETERMINATE }
+
 data class AnnotationMutationResultPacket(
     val requestId: UUID,
-    val success: Boolean,
+    val sessionId: UUID,
+    val dimension: String,
+    val status: NoteWireStatus,
     val annotationId: String,
     val revision: Int,
-    val error: String,
+    val reason: com.bettercontent.betterplayertraces.storage.NoteRejectReason? = null,
+    val deleted: Boolean = false,
 ) {
     fun encode(buf: FriendlyByteBuf) {
-        require(revision >= 0 && error.length <= 256) { "annotation result is invalid" }
-        buf.writeUUID(requestId); buf.writeBoolean(success); buf.writeUtf(annotationId, 36); buf.writeVarInt(revision); buf.writeUtf(error, 256)
+        require(revision >= 0 && dimension.length <= 256 && (status == NoteWireStatus.REJECTED) == (reason != null)) { "annotation result is invalid" }
+        buf.writeUUID(requestId); buf.writeUUID(sessionId); buf.writeUtf(dimension, 256)
+        buf.writeEnum(status); buf.writeUtf(annotationId, 36); buf.writeVarInt(revision)
+        if (reason != null) buf.writeEnum(reason)
+        buf.writeBoolean(deleted)
     }
 
     companion object {
-        fun decode(buf: FriendlyByteBuf): AnnotationMutationResultPacket = AnnotationMutationResultPacket(
-            buf.readUUID(), buf.readBoolean(), buf.readUtf(36), buf.readVarInt().also { require(it >= 0) }, buf.readUtf(256),
-        )
+        fun decode(buf: FriendlyByteBuf): AnnotationMutationResultPacket {
+            val requestId = buf.readUUID(); val sessionId = buf.readUUID(); val dimension = buf.readUtf(256)
+            val status = buf.readEnum(NoteWireStatus::class.java)
+            val id = buf.readUtf(36); val revision = buf.readVarInt().also { require(it >= 0) }
+            val reason = if (status == NoteWireStatus.REJECTED) buf.readEnum(com.bettercontent.betterplayertraces.storage.NoteRejectReason::class.java) else null
+            return AnnotationMutationResultPacket(requestId, sessionId, dimension, status, id, revision, reason, buf.readBoolean())
+        }
     }
 }
 
-data class AnnotationEchoRequestPacket(val annotationId: String, val echoRevision: Int) {
-    fun encode(buf: FriendlyByteBuf) { require(echoRevision >= 1); buf.writeUtf(annotationId, 36); buf.writeVarInt(echoRevision) }
-    companion object { fun decode(buf: FriendlyByteBuf) = AnnotationEchoRequestPacket(buf.readUtf(36), buf.readVarInt().also { require(it >= 1) }) }
+data class AnnotationEchoRequestPacket(val annotationId: String, val echoRevision: Int, val generation: Long = 0L, val dimension: String = "") {
+    fun encode(buf: FriendlyByteBuf) {
+        require(echoRevision >= 1 && generation >= 0L && dimension.length <= 256)
+        buf.writeUtf(annotationId, 36); buf.writeVarInt(echoRevision); buf.writeVarLong(generation); buf.writeUtf(dimension, 256)
+    }
+    companion object { fun decode(buf: FriendlyByteBuf) = AnnotationEchoRequestPacket(
+        buf.readUtf(36), buf.readVarInt().also { require(it >= 1) },
+        buf.readVarLong().also { require(it >= 0L) }, buf.readUtf(256),
+    ) }
 }
 
-data class AnnotationEchoResponsePacket(val annotationId: String, val echoRevision: Int, val encodedClip: ByteArray?) {
+data class AnnotationEchoResponsePacket(
+    val annotationId: String, val echoRevision: Int, val encodedClip: ByteArray?,
+    val generation: Long = 0L, val dimension: String = "", val retryable: Boolean = false,
+) {
     fun encode(buf: FriendlyByteBuf) {
-        require(echoRevision >= 1); require(encodedClip == null || encodedClip.size in 1..AnnotationEchoRecord.MAX_ENCODED_BYTES)
+        require(echoRevision >= 1 && generation >= 0L && dimension.length <= 256)
+        require(encodedClip == null || encodedClip.size in 1..AnnotationEchoRecord.MAX_ENCODED_BYTES)
         buf.writeUtf(annotationId, 36); buf.writeVarInt(echoRevision); buf.writeBoolean(encodedClip != null); encodedClip?.let(buf::writeByteArray)
+        buf.writeVarLong(generation); buf.writeUtf(dimension, 256); buf.writeBoolean(retryable)
     }
     companion object {
         fun decode(buf: FriendlyByteBuf): AnnotationEchoResponsePacket {
             val id = buf.readUtf(36); val revision = buf.readVarInt().also { require(it >= 1) }
             val clip = if (buf.readBoolean()) buf.readByteArray(AnnotationEchoRecord.MAX_ENCODED_BYTES) else null
-            return AnnotationEchoResponsePacket(id, revision, clip)
+            return AnnotationEchoResponsePacket(id, revision, clip, buf.readVarLong().also { require(it >= 0L) }, buf.readUtf(256), buf.readBoolean())
         }
     }
 }
@@ -549,19 +608,24 @@ private fun validateEchoMutation(mutation: EchoMutation, clip: ByteArray?, creat
     require(!creating || mutation != EchoMutation.REMOVE) { "a new annotation cannot remove a gesture" }
 }
 
-data class AnnotationDeletePacket(val id: String, val expectedRevision: Int) {
+data class AnnotationDeletePacket(
+    val id: String, val expectedRevision: Int,
+    val requestId: UUID = UUID.randomUUID(), val sessionId: UUID = UUID.randomUUID(),
+    val dimension: String = "",
+) {
     fun encode(buf: FriendlyByteBuf) {
         require(expectedRevision >= 0) { "annotation revision is invalid" }
-        buf.writeUtf(id, 36)
-        buf.writeVarInt(expectedRevision)
+        require(dimension.length <= 256)
+        buf.writeUUID(requestId); buf.writeUUID(sessionId); buf.writeUtf(dimension, 256); buf.writeUtf(id, 36); buf.writeVarInt(expectedRevision)
     }
 
     companion object {
         fun decode(buf: FriendlyByteBuf): AnnotationDeletePacket {
+            val requestId = buf.readUUID(); val sessionId = buf.readUUID(); val dimension = buf.readUtf(256)
             val id = buf.readUtf(36)
             val revision = buf.readVarInt()
             require(revision >= 0) { "annotation revision is invalid" }
-            return AnnotationDeletePacket(id, revision)
+            return AnnotationDeletePacket(id, revision, requestId, sessionId, dimension)
         }
     }
 }

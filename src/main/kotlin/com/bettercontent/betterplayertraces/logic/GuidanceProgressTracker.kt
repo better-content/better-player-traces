@@ -23,8 +23,13 @@ class GuidanceProgressTracker {
 
     fun observe(playerId: UUID, position: Vec3, route: GuidanceRouteDto?): GuidanceProgressResult {
         if (route == null || route.path.size < 2) return GuidanceProgressResult(0, 0.0)
-        val remaining = pathLength(route.path)
-        if (!remaining.isFinite()) return GuidanceProgressResult(0, 0.0)
+        return observeRemaining(playerId, position, route, pathLength(route.path))
+    }
+
+    /** Same reward rules, with an already budgeted route length from the server-tick cursor. */
+    fun observeRemaining(playerId: UUID, position: Vec3, route: GuidanceRouteDto, remaining: Double,
+                         elapsedTicks: Int = 20): GuidanceProgressResult {
+        if (route.path.isEmpty() || !remaining.isFinite() || remaining < 0.0) return GuidanceProgressResult(0, 0.0)
         val key = RouteKey(playerId, route.targetAnnotationId, route.targetRevision)
         val state = progress.getOrPut(key) { Progress(remaining, 0.0, position) }
         val moved = state.lastPosition.distanceTo(position)
@@ -32,7 +37,8 @@ class GuidanceProgressTracker {
 
         val rawAdvance = (state.shortestRemaining - remaining).coerceAtLeast(0.0)
         state.shortestRemaining = min(state.shortestRemaining, remaining)
-        if (rawAdvance <= 0.0 || moved > MAX_OBSERVATION_MOVEMENT || distance(position, route.path.first()) > ROUTE_REACH) {
+        val allowedMovement = MAX_OBSERVATION_MOVEMENT * (elapsedTicks.coerceIn(1, 200) / 20.0)
+        if (rawAdvance <= 0.0 || moved > allowedMovement || distance(position, route.path.first()) > ROUTE_REACH) {
             return GuidanceProgressResult(0, 0.0)
         }
 
@@ -42,6 +48,13 @@ class GuidanceProgressTracker {
         val experience = floor(state.uncreditedDistance / BLOCKS_PER_EXPERIENCE).toInt()
         if (experience > 0) state.uncreditedDistance -= experience * BLOCKS_PER_EXPERIENCE
         return GuidanceProgressResult(experience, advance)
+    }
+
+    /** A completed route establishes the starting frontier without awarding or consuming movement. */
+    fun seed(playerId: UUID, position: Vec3, route: GuidanceRouteDto, remaining: Double) {
+        if (route.path.size >= 2 && remaining.isFinite() && remaining >= 0.0)
+            progress.putIfAbsent(RouteKey(playerId, route.targetAnnotationId, route.targetRevision),
+                Progress(remaining, 0.0, position))
     }
 
     fun clear(playerId: UUID) {

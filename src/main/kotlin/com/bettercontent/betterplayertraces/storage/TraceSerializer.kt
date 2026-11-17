@@ -25,6 +25,7 @@ import java.util.zip.CRC32
 
 private const val MAGIC = 0x54524143
 private const val MAJOR = 3
+private const val LIVE_MAJOR = 4
 private const val MINOR = 0
 private const val MIGRATABLE_MAJOR = 2
 
@@ -33,6 +34,8 @@ private const val ANNOTATION_BLOCK = 2
 private const val SEEN_BLOCK = 3
 private const val VERSION_BLOCK = 4
 private const val TILE_REVISION_BLOCK = 5
+private const val NOTE_RECEIPT_BLOCK = 6
+private const val MAX_NOTE_RECEIPTS = 500_000
 
 private const val FOOTER_BYTES = 12
 private const val HEADER_EXTRA_INTS = 8
@@ -83,7 +86,7 @@ object TraceSerializer {
         }
     }
 
-    private fun parse(all: ByteArray, path: Path): TraceShardState {
+    private fun parse(all: ByteArray, path: Path, liveOnly: Boolean = false): TraceShardState {
         val state = TraceShardState()
         require(all.size <= MAX_SHARD_BYTES) { "oversized shard: ${all.size} bytes" }
         if (all.size < MAGIC_BYTES + FOOTER_BYTES) {
@@ -107,10 +110,8 @@ object TraceSerializer {
                 if (input.readInt() != MAGIC) throw IllegalArgumentException("unexpected magic")
                 val major = input.readUnsignedShort()
                 val minor = input.readUnsignedShort()
-                if (major != MAJOR && major != MIGRATABLE_MAJOR) {
-                    throw UnsupportedShardVersionException(
-                        "unsupported major version $major; expected $MAJOR or migratable $MIGRATABLE_MAJOR"
-                    )
+                if ((liveOnly && major != LIVE_MAJOR) || (!liveOnly && major != MAJOR && major != MIGRATABLE_MAJOR)) {
+                    throw UnsupportedShardVersionException("unsupported shard version $major for ${if (liveOnly) "live v4" else "legacy fixture"} reader")
                 }
                 repeat(HEADER_EXTRA_INTS) { input.readInt() }
                 log.debug(
@@ -146,19 +147,32 @@ object TraceSerializer {
                             val count = input.readInt()
                             requireCount("annotation", count, MAX_ANNOTATIONS, input)
                             observedRecords += count
-                            repeat(count) { state.addLoadedAnnotation(readAnnotation(input)) }
+                            repeat(count) { state.addLoadedAnnotation(readAnnotation(input, major == LIVE_MAJOR)) }
                         }
                         SEEN_BLOCK -> {
                             val count = input.readInt()
                             requireCount("seen-state", count, MAX_SEEN_STATES, input)
                             observedRecords += count
-                            repeat(count) { state.seenStates.add(readSeenState(input)) }
+                            repeat(count) { readSeenState(input).let {
+                                require(state.seenStates.add(it)) { "duplicate seen-state identity" }
+                                state.indexSeen(it)
+                            } }
+                        }
+                        NOTE_RECEIPT_BLOCK -> {
+                            require(major == LIVE_MAJOR) { "note receipts require v4" }
+                            val count = input.readInt()
+                            require(count in 0..MAX_NOTE_RECEIPTS && count <= input.available() / 32) { "invalid note receipt count" }
+                            repeat(count) {
+                                val id = UUID(input.readLong(), input.readLong())
+                                val request = UUID(input.readLong(), input.readLong())
+                                require(state.noteReceipts.putIfAbsent(id, request) == null) { "duplicate note receipt" }
+                            }
                         }
                         VERSION_BLOCK -> {
                             input.readInt()
                         }
                         TILE_REVISION_BLOCK -> {
-                            require(major == MAJOR) { "tile revisions are not valid in shard version $major" }
+                            require(major == MAJOR || major == LIVE_MAJOR) { "tile revisions are not valid in shard version $major" }
                             require(!readTileRevisionBlock) { "duplicate tile revision block" }
                             readTileRevisionBlock = true
                             val count = input.readInt()
@@ -183,7 +197,7 @@ object TraceSerializer {
                 require(observedRecords == footerCount) {
                     "footer record count $footerCount does not match $observedRecords"
                 }
-                require(major != MAJOR || readTileRevisionBlock) { "missing tile revision block" }
+                require((major != MAJOR && major != LIVE_MAJOR) || readTileRevisionBlock) { "missing tile revision block" }
                 if (major == MIGRATABLE_MAJOR) state.markDirty()
             }
             return state
@@ -194,14 +208,24 @@ object TraceSerializer {
         }
     }
 
-    internal fun encodeV3(state: TraceShardState, bounds: Pair<BlockPos, BlockPos>): ByteArray {
+    internal fun encodeV3(state: TraceShardState, bounds: Pair<BlockPos, BlockPos>): ByteArray = encode(state, bounds, MAJOR)
+
+    internal fun encodeV4(state: TraceShardState, bounds: Pair<BlockPos, BlockPos>): ByteArray = encode(state, bounds, LIVE_MAJOR)
+
+    internal fun decodeV4(bytes: ByteArray, label: Path): TraceShardState = parse(bytes, label, liveOnly = true)
+
+    private fun encode(state: TraceShardState, bounds: Pair<BlockPos, BlockPos>, major: Int): ByteArray {
+        require(state.footTraces.size <= MAX_FOOT_TRACES && state.annotations.size <= MAX_ANNOTATIONS &&
+            state.seenStates.size <= MAX_SEEN_STATES && state.tileRevisionsSnapshot().size <= MAX_TILE_REVISIONS) {
+            "shard record counts exceed the codec safety envelope"
+        }
         require(state.footTraces.none { it.kind == TraceKind.FOOTPRINT && it.support == null }) {
             "footprint trace has no supporting block"
         }
         val payload = ByteArrayOutputStream()
         DataOutputStream(payload).use { out ->
             out.writeInt(MAGIC)
-            out.writeShort(MAJOR)
+            out.writeShort(major)
             out.writeShort(MINOR)
             out.writeInt(bounds.first.x)
             out.writeInt(bounds.first.y)
@@ -227,11 +251,20 @@ object TraceSerializer {
 
             out.writeByte(ANNOTATION_BLOCK)
             out.writeInt(state.annotations.size)
-            state.annotations.forEach { writeAnnotation(out, it) }
+            state.annotations.forEach { writeAnnotation(out, it, major == LIVE_MAJOR) }
 
             out.writeByte(SEEN_BLOCK)
             out.writeInt(state.seenStates.size)
             state.seenStates.forEach { writeSeenState(out, it) }
+            if (major == LIVE_MAJOR) {
+                require(state.noteReceipts.size <= MAX_NOTE_RECEIPTS) { "too many note receipts" }
+                out.writeByte(NOTE_RECEIPT_BLOCK)
+                out.writeInt(state.noteReceipts.size)
+                state.noteReceipts.forEach { (id, request) ->
+                    out.writeLong(id.mostSignificantBits); out.writeLong(id.leastSignificantBits)
+                    out.writeLong(request.mostSignificantBits); out.writeLong(request.leastSignificantBits)
+                }
+            }
             out.writeByte(VERSION_BLOCK)
             out.writeInt(1)
         }
@@ -365,7 +398,7 @@ object TraceSerializer {
         }
     }
 
-    private fun writeAnnotation(output: DataOutputStream, annotation: TraceAnnotation) {
+    private fun writeAnnotation(output: DataOutputStream, annotation: TraceAnnotation, live: Boolean = false) {
         output.writeUTF(annotation.id.toString())
         output.writeUTF(annotation.text)
         output.writeUTF(annotation.icon)
@@ -380,6 +413,14 @@ object TraceSerializer {
         output.writeInt(annotation.revision)
         output.writeLong(annotation.createdByInternal.mostSignificantBits)
         output.writeLong(annotation.createdByInternal.leastSignificantBits)
+        if (live) {
+            val echo = annotation.encodedEcho
+            output.writeInt(echo?.size ?: 0)
+            if (echo != null) {
+                require(echo.size in 1..com.bettercontent.betterplayertraces.domain.AnnotationEchoRecord.MAX_ENCODED_BYTES)
+                output.write(echo)
+            }
+        }
     }
 
     private fun writeSeenState(output: DataOutputStream, state: SeenStateRecord) {
@@ -441,7 +482,7 @@ object TraceSerializer {
         return position
     }
 
-    private fun readAnnotation(input: DataInputStream): TraceAnnotation {
+    private fun readAnnotation(input: DataInputStream, live: Boolean = false): TraceAnnotation {
         val id = UUID.fromString(readUtf(input, 36, "annotation id"))
         val text = readUtf(input, 256, "annotation text")
         val icon = readUtf(input, 64, "annotation icon")
@@ -456,7 +497,14 @@ object TraceSerializer {
         val revision = input.readInt()
         require(revision >= 0) { "negative annotation revision" }
         val creator = UUID(input.readLong(), input.readLong())
-        return TraceAnnotation(id, text, icon, color, BlockPos(x, y, z), BlockPos(tx, ty, tz), team, revision, creator)
+        val echo = if (live) {
+            val size = input.readInt()
+            require(size in 0..com.bettercontent.betterplayertraces.domain.AnnotationEchoRecord.MAX_ENCODED_BYTES && size <= input.available()) {
+                "invalid annotation echo length $size"
+            }
+            if (size == 0) null else ByteArray(size).also(input::readFully)
+        } else null
+        return TraceAnnotation(id, text, icon, color, BlockPos(x, y, z), BlockPos(tx, ty, tz), team, revision, creator, echo)
     }
 
     private fun readSeenState(input: DataInputStream): SeenStateRecord {

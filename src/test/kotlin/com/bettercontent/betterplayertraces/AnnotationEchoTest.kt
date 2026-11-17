@@ -92,20 +92,38 @@ class AnnotationEchoTest {
         val createBuffer = FriendlyByteBuf(Unpooled.buffer()).also(create::encode)
         val decodedCreate = AnnotationCreatePacket.decode(createBuffer)
         assertEquals(create.requestId, decodedCreate.requestId)
+        assertEquals(create.sessionId, decodedCreate.sessionId)
+        assertEquals(create.dimension, decodedCreate.dimension)
         assertArrayEquals(encoded, decodedCreate.encodedClip)
 
         val update = AnnotationUpdatePacket(UUID.randomUUID(), UUID.randomUUID().toString(), 3, "hello", "", 0, EchoMutation.REMOVE, null)
         val updateBuffer = FriendlyByteBuf(Unpooled.buffer()).also(update::encode)
         assertEquals(update, AnnotationUpdatePacket.decode(updateBuffer))
 
-        val result = AnnotationMutationResultPacket(UUID.randomUUID(), false, "", 0, "out of reach")
+        val result = AnnotationMutationResultPacket(UUID.randomUUID(), UUID.randomUUID(), "minecraft:overworld",
+            com.bettercontent.betterplayertraces.network.NoteWireStatus.REJECTED, "", 0,
+            com.bettercontent.betterplayertraces.storage.NoteRejectReason.OUT_OF_REACH)
         val resultBuffer = FriendlyByteBuf(Unpooled.buffer()).also(result::encode)
         assertEquals(result, AnnotationMutationResultPacket.decode(resultBuffer))
+        val uncertain = result.copy(status = com.bettercontent.betterplayertraces.network.NoteWireStatus.INDETERMINATE, reason = null)
+        assertEquals(uncertain, AnnotationMutationResultPacket.decode(FriendlyByteBuf(Unpooled.buffer()).also(uncertain::encode)),
+            "unknown publication is not wire-encoded as rejection")
+        val pending = uncertain.copy(status = com.bettercontent.betterplayertraces.network.NoteWireStatus.PENDING)
+        assertEquals(pending, AnnotationMutationResultPacket.decode(FriendlyByteBuf(Unpooled.buffer()).also(pending::encode)))
+        val deleted = AnnotationMutationResultPacket(UUID.randomUUID(), UUID.randomUUID(), "minecraft:overworld",
+            com.bettercontent.betterplayertraces.network.NoteWireStatus.COMMITTED, UUID.randomUUID().toString(), 2, deleted = true)
+        assertEquals(deleted, AnnotationMutationResultPacket.decode(FriendlyByteBuf(Unpooled.buffer()).also(deleted::encode)))
+        val delete = com.bettercontent.betterplayertraces.network.AnnotationDeletePacket(UUID.randomUUID().toString(), 2,
+            UUID.randomUUID(), UUID.randomUUID(), "minecraft:overworld")
+        assertEquals(delete, com.bettercontent.betterplayertraces.network.AnnotationDeletePacket.decode(
+            FriendlyByteBuf(Unpooled.buffer()).also(delete::encode)))
 
-        val response = AnnotationEchoResponsePacket(UUID.randomUUID().toString(), 4, encoded)
+        val response = AnnotationEchoResponsePacket(UUID.randomUUID().toString(), 4, encoded, 3L, "minecraft:overworld")
         val responseBuffer = FriendlyByteBuf(Unpooled.buffer()).also(response::encode)
         val decodedResponse = AnnotationEchoResponsePacket.decode(responseBuffer)
         assertArrayEquals(encoded, decodedResponse.encodedClip)
+        assertEquals(response.generation, decodedResponse.generation)
+        assertEquals(response.dimension, decodedResponse.dimension)
     }
 
     @Test fun echoPersistenceRoundTripsAndPrunesOrphans() {

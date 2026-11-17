@@ -708,6 +708,7 @@ class TraceCoreTest {
                 .encode(FriendlyByteBuf(Unpooled.buffer()))
         }
         val negative = FriendlyByteBuf(Unpooled.buffer()).apply {
+            writeUUID(UUID.randomUUID()); writeUUID(UUID.randomUUID()); writeUtf("minecraft:overworld", 256)
             writeUtf(UUID.randomUUID().toString(), 36)
             writeVarInt(-1)
             writeUtf("text", 256)

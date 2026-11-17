@@ -23,31 +23,31 @@ class TraceQueryService : TraceQueryApi {
 
     override fun trafficPotential(level: Level, pos: BlockPos): TrafficPotential {
         if (level !is ServerLevel) {
-            return TrafficPotential(level.toString(), pos.asLong(), 0, 0, 0f, 0f, 0, false)
+            return TrafficPotential(level.toString(), pos.asLong(), 0, 0, 0f, 0f, 0, false, globalReady = false)
         }
         val runtime = TracesMod.getRuntime(level.server)
         val levelKey = level.dimension().location().toString()
-        val min = BlockPos(pos.x - 48, 0, pos.z - 48)
-        val max = BlockPos(pos.x + 48, 255, pos.z + 48)
-        val localTraces = runtime.storage(level).queryTraces(min, max)
+        val min = BlockPos(pos.x - 48, level.minBuildHeight, pos.z - 48)
+        val max = BlockPos(pos.x + 48, level.maxBuildHeight - 1, pos.z + 48)
+        val storage = runtime.storage(level)
+        val localTraces = storage.queryTraces(min, max)
         val localAlive = localTraces.filter { it.surviving }
         val localSurvivingStrength = localAlive.sumOf { it.strength.toDouble() }.toFloat()
 
         val shard = Geometry.worldToShard(pos)
         val regionalBounds = Geometry.shardToBounds(shard.first, shard.second)
-        val regionalTraces = runtime.storage(level).queryTraces(regionalBounds.first, regionalBounds.second)
+        val regionalTraces = storage.queryTraces(
+            BlockPos(regionalBounds.first.x, level.minBuildHeight, regionalBounds.first.z),
+            BlockPos(regionalBounds.second.x, level.maxBuildHeight - 1, regionalBounds.second.z),
+        )
         val regionalAlive = regionalTraces.filter { it.surviving }
         val regionalSurvivingStrength = regionalAlive.sumOf { it.strength.toDouble() }.toFloat()
 
-        val serverStrengths = runtime.storage(level).allSurvivingFootTraces(levelKey).filter { it.surviving }
-        val serverSurvivingStrength = serverStrengths.sumOf { it.strength.toDouble() }.toFloat()
-
-        val allAliveStrengths = serverStrengths.map { it.strength }
-        val serverPercentile = localAlive.maxOfOrNull { it.strength }?.let { localMax ->
-            percentileRank(allAliveStrengths, localMax)
-        } ?: 0f
-
-        val regionalShare = if (serverSurvivingStrength > 0f) regionalSurvivingStrength / serverSurvivingStrength else 0f
+        val globalStrength = storage.serverSurvivingStrength()
+        val globalPercentile = localAlive.maxOfOrNull { it.strength }?.let(storage::serverPercentile)
+        val globalReady = globalStrength != null && (localAlive.isEmpty() || globalPercentile != null)
+        val serverSurvivingStrength = globalStrength ?: 0f
+        val regionalShare = if (globalReady && serverSurvivingStrength > 0f) regionalSurvivingStrength / serverSurvivingStrength else 0f
         val alive = localTraces.count { it.surviving }
         val strength = localTraces.map { it.strength }
         return TrafficPotential(
@@ -63,15 +63,9 @@ class TraceQueryService : TraceQueryApi {
             regionalSurvivingStrength = regionalSurvivingStrength,
             serverSurvivingStrength = serverSurvivingStrength,
             regionalShare = regionalShare,
-            serverShare = if (serverSurvivingStrength > 0f) localSurvivingStrength / serverSurvivingStrength else 0f,
-            percentile = serverPercentile,
+            serverShare = if (globalReady && serverSurvivingStrength > 0f) localSurvivingStrength / serverSurvivingStrength else 0f,
+            percentile = globalPercentile ?: 0f,
+            globalReady = globalReady,
         )
     }
-}
-
-private fun percentileRank(sorted: List<Float>, value: Float): Float {
-    if (sorted.isEmpty()) return 0f
-    val sortedAscending = sorted.sorted()
-    val countLe = sortedAscending.count { it <= value }
-    return (countLe.toFloat() / sortedAscending.size.toFloat()).coerceIn(0f, 1f)
 }

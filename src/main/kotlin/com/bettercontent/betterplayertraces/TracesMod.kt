@@ -44,6 +44,8 @@ class TracesMod {
             return runtimes.getOrPut(server) { TraceServerRuntime(server) }
         }
 
+        fun runtimeIfPresent(server: MinecraftServer): TraceServerRuntime? = runtimes[server]
+
         fun removeRuntime(server: MinecraftServer) {
             runtimes.remove(server)?.close()
         }

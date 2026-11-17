@@ -15,13 +15,15 @@ import com.bettercontent.betterplayertraces.echo.EchoRoot
 import com.bettercontent.betterplayertraces.logic.AnnotationService
 import com.bettercontent.betterplayertraces.logic.ErosionService
 import com.bettercontent.betterplayertraces.api.event.TraceEpisodeEvent
-import com.bettercontent.betterplayertraces.storage.AnnotationEchoSavedData
+import com.bettercontent.betterplayertraces.storage.NoteMutationResult
+import com.bettercontent.betterplayertraces.storage.NoteRejectReason
 import com.bettercontent.betterplayertraces.storage.TraceStorageManager
+import com.bettercontent.betterplayertraces.storage.TraceReadUnavailableException
 import com.bettercontent.betterplayertraces.trace.TraceEpisodes
 import net.minecraft.core.BlockPos
 import net.minecraft.gametest.framework.GameTest
 import net.minecraft.gametest.framework.GameTestHelper
-import net.minecraft.nbt.CompoundTag
+import com.bettercontent.betterplayertraces.domain.EchoMutation
 import net.minecraft.server.level.ServerPlayer
 import net.minecraft.resources.ResourceLocation
 import net.minecraft.world.level.block.Blocks
@@ -43,6 +45,66 @@ object TraceGametestProbe {
         }
     }
 
+    /** Native note fixtures advance server ticks; never join archive futures on the game thread. */
+    private fun awaitNote(
+        helper: GameTestHelper, storage: TraceStorageManager,
+        submit: ((NoteMutationResult) -> Unit) -> NoteMutationResult,
+        committed: (com.bettercontent.betterplayertraces.domain.TraceAnnotation?) -> Unit,
+    ) {
+        var outcome: NoteMutationResult? = null
+        fun poll(remaining: Int) {
+            try {
+                storage.pollCompletions()
+                storage.tickSummaries()
+                when (val result = outcome) {
+                    is NoteMutationResult.Committed -> committed(result.annotation)
+                    is NoteMutationResult.Rejected -> helper.assertTrue(false, "note publication rejected: ${result.reason}")
+                    else -> {
+                        helper.assertTrue(remaining > 0, "note publication did not complete: $result")
+                        helper.runAfterDelay(1L) { poll(remaining - 1) }
+                    }
+                }
+            } catch (failure: Throwable) { storage.close(); throw failure }
+        }
+        fun attempt(remaining: Int) {
+            try {
+                storage.pollCompletions()
+                storage.tickSummaries()
+                val initial = submit { outcome = it }
+                if (initial == NoteMutationResult.Rejected(NoteRejectReason.STORAGE_UNAVAILABLE)) {
+                    helper.assertTrue(remaining > 0, "archive did not become readable")
+                    helper.runAfterDelay(1L) { attempt(remaining - 1) }
+                } else {
+                    helper.assertTrue(initial is NoteMutationResult.Pending, "note admission failed: $initial")
+                    poll(remaining)
+                }
+            } catch (failure: Throwable) { storage.close(); throw failure }
+        }
+        attempt(180)
+    }
+
+    private fun awaitReopenedEcho(
+        helper: GameTestHelper, writer: TraceStorageManager, id: UUID, revision: Int, bytes: ByteArray, done: () -> Unit,
+    ) {
+        val reader = TraceStorageManager(helper.level, TracesConfig.common)
+        fun check(remaining: Int) {
+            try {
+                reader.tickSummaries()
+                val reopened = reader.annotationEcho(id)
+                helper.assertTrue(reopened?.annotationRevision == revision && reopened?.encodedClip?.contentEquals(bytes) == true,
+                    "fresh v4 shard reader must recover the durably published note+echo")
+                reader.close()
+                done()
+            } catch (_: TraceReadUnavailableException) {
+                if (remaining <= 0) {
+                    reader.close(); writer.close()
+                    helper.assertTrue(false, "fresh v4 reader did not become available")
+                } else helper.runAfterDelay(1L) { check(remaining - 1) }
+            } catch (failure: Throwable) { reader.close(); writer.close(); throw failure }
+        }
+        check(120)
+    }
+
     @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 200)
     @JvmStatic
     fun footTrafficProbeIsReadOnly(helper: GameTestHelper) {
@@ -51,7 +113,16 @@ object TraceGametestProbe {
         val query = com.bettercontent.betterplayertraces.logic.TraceQueryService()
         // An isolated shard keeps local/regional totals exact; server total includes any other fixtures.
         val origin = BlockPos(100_096, 64, 100_096)
-        val baseline = query.trafficPotential(level, origin)
+        val baseline = try { query.trafficPotential(level, origin) }
+        catch (_: TraceReadUnavailableException) {
+            helper.runAfterDelay(1L) { footTrafficProbeIsReadOnly(helper) }
+            return
+        }
+        if (!baseline.globalReady) {
+            // Archive-wide summaries advance on server ticks; a pending result is never zero.
+            helper.runAfterDelay(1L) { footTrafficProbeIsReadOnly(helper) }
+            return
+        }
         helper.assertTrue(baseline.traceCount == 0 && baseline.regionalSurvivingStrength == 0f, "fixture shard must be empty")
         val positions = listOf(origin, origin.offset(100, 0, 0), origin.offset(512, 0, 0))
         val traces = positions.mapIndexed { i, pos ->
@@ -61,7 +132,18 @@ object TraceGametestProbe {
         }
         traces.forEach { helper.assertTrue(storage.addFootTrace(it), "fixture trace accepted") }
         val before = positions.map { storage.traceTileSnapshot(it.x shr 4, it.z shr 4) }
-        val potential = query.trafficPotential(level, origin)
+        fun verifyWhenReady(remaining: Int) {
+        val potential = try { query.trafficPotential(level, origin) }
+        catch (_: TraceReadUnavailableException) {
+            helper.assertTrue(remaining > 0, "probe local archive did not become ready")
+            helper.runAfterDelay(1L) { verifyWhenReady(remaining - 1) }
+            return
+        }
+        if (!potential.globalReady) {
+            helper.assertTrue(remaining > 0, "archive-wide probe summary did not become ready")
+            helper.runAfterDelay(1L) { verifyWhenReady(remaining - 1) }
+            return
+        }
         helper.assertTrue(potential.traceCount == 1 && potential.aliveCount == 1 && potential.sequenceCount == 1, "exact local counts")
         helper.assertTrue(potential.localSurvivingStrength == 1f && potential.regionalSurvivingStrength == 3f, "local and regional strength")
         helper.assertTrue(potential.serverSurvivingStrength == baseline.serverSurvivingStrength + 6f, "server strength includes remote shard")
@@ -84,6 +166,8 @@ object TraceGametestProbe {
         helper.assertTrue(query.trafficPotential(level, origin) == potential, "query and probe must not alter totals")
         helper.assertTrue(positions.map { storage.traceTileSnapshot(it.x shr 4, it.z shr 4) } == before, "query and probe must not mutate shard records/revisions")
         helper.succeed()
+        }
+        verifyWhenReady(120)
     }
 
     private fun validEchoClip(): ByteArray = EchoClipCodec.encodeQuantized(
@@ -295,18 +379,18 @@ object TraceGametestProbe {
         val player = helper.makeMockSurvivalPlayer()
         val target = player.blockPosition().offset(2, 0, 0)
 
-        try {
-            val annotation = service.create(level, player, "probe", "pin", 0x55D66B, target)
-            level.setBlockAndUpdate(target, Blocks.STONE.defaultBlockState())
-
-            val boundsMin = target.offset(-1, 0, -1)
-            val boundsMax = target.offset(1, 0, 1)
-            val visible = service.annotationsWithin(level, boundsMin, boundsMax, player)
-
-            helper.assertTrue(visible.annotations.any { it.id == annotation.id }, "annotation should persist when block is replaced")
-            helper.succeed()
-        } finally {
-            storage.close()
+        awaitNote(helper, storage,
+            { done -> service.submitCreate(level, player, UUID.randomUUID(), target, "probe", "pin", 0x55D66B, null, done) },
+        ) { annotation ->
+            try {
+                helper.assertTrue(annotation != null, "committed creation must return the note")
+                level.setBlockAndUpdate(target, Blocks.STONE.defaultBlockState())
+                val boundsMin = target.offset(-1, 0, -1)
+                val boundsMax = target.offset(1, 0, 1)
+                val visible = service.annotationsWithin(level, boundsMin, boundsMax, player)
+                helper.assertTrue(visible.annotations.any { it.id == annotation?.id }, "annotation should persist when block is replaced")
+                helper.succeed()
+            } finally { storage.close() }
         }
     }
 
@@ -320,23 +404,14 @@ object TraceGametestProbe {
         val viewer = helper.makeMockSurvivalPlayer()
         val position = author.blockPosition().offset(2, 0, 0)
 
-        try {
-            val created = service.create(level, author, "team check", "pin", 0x579DFF, position)
-
-            val visible = service.annotationsWithin(
-                level,
-                position.offset(-4, 0, -4),
-                position.offset(4, 64, 4),
-                viewer,
-            )
-
-            helper.assertTrue(
-                visible.annotations.any { it.id == created.id },
-                "global-team annotations should be visible to all players"
-            )
-            helper.succeed()
-        } finally {
-            storage.close()
+        awaitNote(helper, storage,
+            { done -> service.submitCreate(level, author, UUID.randomUUID(), position, "team check", "pin", 0x579DFF, null, done) },
+        ) { created ->
+            try {
+                val visible = service.annotationsWithin(level, position.offset(-4, 0, -4), position.offset(4, 64, 4), viewer)
+                helper.assertTrue(visible.annotations.any { it.id == created?.id }, "global-team annotations should be visible to all players")
+                helper.succeed()
+            } finally { storage.close() }
         }
     }
 
@@ -350,21 +425,34 @@ object TraceGametestProbe {
         val author = helper.makeMockSurvivalPlayer()
         val viewer = helper.makeMockSurvivalPlayer()
         val target = author.blockPosition().offset(1, 0, 0)
-        try {
-            val created = service.create(level, author, "first", "pin", 0x579DFF, target)
-            helper.assertTrue(runCatching { service.create(level, author, "duplicate", "pin", 0x579DFF, target) }.isFailure, "one creator may only have one note per block")
-            helper.assertTrue(runCatching { service.update(level, viewer, created.id, 1, "stolen", null, null) }.isFailure, "other players must not update notes")
-            helper.assertTrue(!service.delete(level, viewer, created.id, 1), "other players must not delete notes")
-            val updated = service.update(level, author, created.id, 1, "second", null, null)
-            helper.assertTrue(updated.revision == 2, "owner update should increment revision")
-            helper.assertTrue(runCatching { service.update(level, author, created.id, 1, "stale", null, null) }.isFailure, "stale revisions must be rejected")
-            helper.assertTrue(!service.acknowledgeViewed(viewer, created.id, 1), "stale viewed revisions must be rejected")
-            helper.assertTrue(service.acknowledgeViewed(viewer, created.id, 2), "nearby current revision should be acknowledged")
-            helper.assertTrue(service.seenRevision(viewer.uuid, created.id) == 2, "viewed revision should persist")
-            helper.assertTrue(service.delete(level, author, created.id, 2), "owner should delete current revision")
-            helper.succeed()
-        } finally {
-            storage.close()
+        awaitNote(helper, storage,
+            { done -> service.submitCreate(level, author, UUID.randomUUID(), target, "first", "pin", 0x579DFF, null, done) },
+        ) { created ->
+            val id = requireNotNull(created).id
+            helper.assertTrue(service.submitCreate(level, author, UUID.randomUUID(), target, "duplicate", "pin", 0x579DFF, null) {} ==
+                NoteMutationResult.Rejected(NoteRejectReason.TARGET_BUSY), "one creator may only have one note per block")
+            helper.assertTrue(service.submitUpdate(level, viewer, UUID.randomUUID(), id, 1, "stolen", "pin", 0x579DFF, EchoMutation.KEEP, null) {} ==
+                NoteMutationResult.Rejected(NoteRejectReason.PERMISSION), "other players must not update notes")
+            helper.assertTrue(service.submitDelete(level, viewer, UUID.randomUUID(), id, 1) {} ==
+                NoteMutationResult.Rejected(NoteRejectReason.PERMISSION), "other players must not delete notes")
+            awaitNote(helper, storage,
+                { done -> service.submitUpdate(level, author, UUID.randomUUID(), id, 1, "second", "pin", 0x579DFF, EchoMutation.KEEP, null, done) },
+            ) { updated ->
+                helper.assertTrue(updated?.revision == 2, "owner update should increment revision")
+                helper.assertTrue(service.submitUpdate(level, author, UUID.randomUUID(), id, 1, "stale", "pin", 0x579DFF, EchoMutation.KEEP, null) {} ==
+                    NoteMutationResult.Rejected(NoteRejectReason.REVISION_CONFLICT), "stale revisions must be rejected")
+                helper.assertTrue(!service.acknowledgeViewed(viewer, id, 1), "stale viewed revisions must be rejected")
+                helper.assertTrue(service.acknowledgeViewed(viewer, id, 2), "nearby current revision should be acknowledged")
+                helper.assertTrue(service.seenRevision(viewer.uuid, id) == 2, "viewed revision should persist")
+                awaitNote(helper, storage,
+                    { done -> service.submitDelete(level, author, UUID.randomUUID(), id, 2, done) },
+                ) { deleted ->
+                    try {
+                        helper.assertTrue(deleted == null && storage.annotationById(id) == null, "owner delete must publish absent note")
+                        helper.succeed()
+                    } finally { storage.close() }
+                }
+            }
         }
     }
 
@@ -376,43 +464,67 @@ object TraceGametestProbe {
         val service = AnnotationService(storage)
         val owner = helper.makeMockSurvivalPlayer()
         val target = owner.blockPosition().offset(2, 0, 0)
-        val echoes = AnnotationEchoSavedData()
-
-        try {
-            val created = service.createComponents(level, owner, "", "", 0, target, hasEcho = true)
-            echoes.replace(AnnotationEchoRecord(created.id, created.revision, owner.uuid, validEchoClip()))
-            val restored = AnnotationEchoSavedData.load(echoes.save(CompoundTag()))
-            helper.assertTrue(restored.get(created.id)?.annotationRevision == 1, "echo should survive saved-data reload")
-
-            val updated = service.updateComponents(level, owner, created.id, 1, "gesture", "", 0, hasEchoAfterMutation = true)
-            val prior = restored.get(created.id)!!
-            restored.replace(AnnotationEchoRecord(created.id, updated.revision, prior.ownerId, prior.encodedClip))
-            helper.assertTrue(updated.revision == 2 && restored.get(created.id)?.annotationRevision == 2, "note and kept echo should revise together")
-
-            helper.assertTrue(service.delete(level, owner, created.id, 2), "owner should delete the revised note")
-            helper.assertTrue(restored.remove(created.id), "deleting a note should delete its echo")
-            helper.assertTrue(restored.get(created.id) == null, "deleted echo must not remain queryable")
-            helper.succeed()
-        } finally {
-            storage.close()
+        val clip = validEchoClip()
+        awaitNote(helper, storage,
+            { done -> service.submitCreate(level, owner, UUID.randomUUID(), target, "", "", 0, clip, done) },
+        ) { created ->
+            val id = requireNotNull(created).id
+            helper.assertTrue(storage.annotationEcho(id)?.encodedClip?.contentEquals(clip) == true,
+                "durably published note and echo must be visible from same shard authority")
+            awaitNote(helper, storage,
+                { done -> service.submitUpdate(level, owner, UUID.randomUUID(), id, 1, "gesture", "", 0, EchoMutation.KEEP, null, done) },
+            ) { updated ->
+                helper.assertTrue(updated?.revision == 2 && storage.annotationEcho(id)?.annotationRevision == 2 &&
+                    storage.annotationEcho(id)?.encodedClip?.contentEquals(clip) == true, "note and kept echo must revise atomically")
+                awaitReopenedEcho(helper, storage, id, 2, clip) {
+                    awaitNote(helper, storage,
+                        { done -> service.submitDelete(level, owner, UUID.randomUUID(), id, 2, done) },
+                    ) { deleted ->
+                        try {
+                            helper.assertTrue(deleted == null && storage.annotationById(id) == null && storage.annotationEcho(id) == null,
+                                "deleting a note must durably remove its echo")
+                            helper.succeed()
+                        } finally { storage.close() }
+                    }
+                }
+            }
         }
     }
 
-    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 220)
+    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 1000)
     @JvmStatic
     fun annotationEchoCapacityRejectsWithoutEviction(helper: GameTestHelper) {
-        val echoes = AnnotationEchoSavedData()
-        val owner = UUID.randomUUID()
+        val level = helper.level
+        val storage = TraceStorageManager(level, TracesConfig.common)
+        val service = AnnotationService(storage)
+        val owner = helper.makeMockSurvivalPlayer()
         val clip = validEchoClip()
-        repeat(AnnotationEchoRecord.MAX_PER_PLAYER) {
-            echoes.replace(AnnotationEchoRecord(UUID.randomUUID(), 1, owner, clip))
+        val positions = (0 until AnnotationEchoRecord.MAX_PER_PLAYER).map { index ->
+            owner.blockPosition().offset(index % 8 - 3, 0, index / 8 - 3)
         }
-        val existingIds = echoes.all().map { it.annotationId }.toSet()
-        val rejected = runCatching { echoes.requireCapacity(UUID.randomUUID(), owner) }.isFailure
-        helper.assertTrue(rejected, "the 65th player-owned echo should be rejected")
-        helper.assertTrue(echoes.count() == AnnotationEchoRecord.MAX_PER_PLAYER, "capacity rejection must not change the echo count")
-        helper.assertTrue(echoes.all().map { it.annotationId }.toSet() == existingIds, "capacity rejection must not evict an existing gesture")
-        helper.succeed()
+        val ids = mutableSetOf<UUID>()
+        fun next(index: Int) {
+            if (index == positions.size) {
+                try {
+                    val rejected = service.submitCreate(level, owner, UUID.randomUUID(), owner.blockPosition().offset(5, 0, 0),
+                        "extra", "pin", 0x579DFF, clip) {}
+                    helper.assertTrue(rejected == NoteMutationResult.Rejected(NoteRejectReason.STORAGE_CAPACITY),
+                        "the 65th player-owned echo must be rejected before publication")
+                    helper.assertTrue(ids.size == AnnotationEchoRecord.MAX_PER_PLAYER &&
+                        ids.all { storage.annotationEcho(it)?.encodedClip?.contentEquals(clip) == true },
+                        "capacity rejection must neither change nor evict existing shard echoes")
+                    helper.succeed()
+                } finally { storage.close() }
+                return
+            }
+            awaitNote(helper, storage,
+                { done -> service.submitCreate(level, owner, UUID.randomUUID(), positions[index], "note", "pin", 0x579DFF, clip, done) },
+            ) { created ->
+                ids += requireNotNull(created).id
+                next(index + 1)
+            }
+        }
+        next(0)
     }
 
     @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 220)
@@ -424,21 +536,22 @@ object TraceGametestProbe {
         val owner = helper.makeMockSurvivalPlayer()
         val stranger = helper.makeMockSurvivalPlayer()
         val target = owner.blockPosition().offset(2, 0, 0)
-        val echoes = AnnotationEchoSavedData()
-
-        try {
-            val created = service.createComponents(level, owner, "", "pin", AnnotationComponents.colors.getValue("cyan"), target, hasEcho = true)
-            val encoded = validEchoClip()
-            echoes.replace(AnnotationEchoRecord(created.id, 1, owner.uuid, encoded))
-            val denied = runCatching {
-                service.updateComponents(level, stranger, created.id, 1, "stolen", "", 0, hasEchoAfterMutation = false)
-            }.isFailure
-            helper.assertTrue(denied, "another player must not replace or remove an echo")
-            helper.assertTrue(storage.annotationById(created.id)?.revision == 1, "denied edit must not increment the note revision")
-            helper.assertTrue(echoes.get(created.id)?.encodedClip?.contentEquals(encoded) == true, "denied edit must preserve the original clip")
-            helper.succeed()
-        } finally {
-            storage.close()
+        val encoded = validEchoClip()
+        awaitNote(helper, storage,
+            { done -> service.submitCreate(level, owner, UUID.randomUUID(), target, "", "pin",
+                AnnotationComponents.colors.getValue("cyan"), encoded, done) },
+        ) { created ->
+            try {
+                val id = requireNotNull(created).id
+                val denied = service.submitUpdate(level, stranger, UUID.randomUUID(), id, 1, "stolen", "", 0,
+                    EchoMutation.REMOVE, null) {}
+                helper.assertTrue(denied == NoteMutationResult.Rejected(NoteRejectReason.PERMISSION),
+                    "another player must not replace or remove an echo")
+                helper.assertTrue(storage.annotationById(id)?.revision == 1, "denied edit must not increment note revision")
+                helper.assertTrue(storage.annotationEcho(id)?.encodedClip?.contentEquals(encoded) == true,
+                    "denied edit must preserve the original shard clip")
+                helper.succeed()
+            } finally { storage.close() }
         }
     }
 
@@ -455,18 +568,24 @@ object TraceGametestProbe {
         }.also {
             it.setPos(owner.x, owner.y, owner.z)
         }
-        val echoes = AnnotationEchoSavedData()
-
-        try {
-            val created = service.createComponents(level, owner, "original", "", 0, target, hasEcho = true)
-            echoes.replace(AnnotationEchoRecord(created.id, 1, owner.uuid, validEchoClip()))
-            val updated = service.updateComponents(level, operator, created.id, 1, "moderated", "memorial", AnnotationComponents.colors.getValue("white"), hasEchoAfterMutation = true)
-            echoes.replace(AnnotationEchoRecord(created.id, updated.revision, owner.uuid, validEchoClip()))
-            helper.assertTrue(updated.revision == 2, "operator replacement should increment the note revision")
-            helper.assertTrue(echoes.get(created.id)?.annotationRevision == 2, "operator replacement should invalidate the old echo revision")
-            helper.succeed()
-        } finally {
-            storage.close()
+        val priorClip = validEchoClip()
+        val replacementClip = validEchoClip().copyOf()
+        awaitNote(helper, storage,
+            { done -> service.submitCreate(level, owner, UUID.randomUUID(), target, "original", "", 0, priorClip, done) },
+        ) { created ->
+            val id = requireNotNull(created).id
+            awaitNote(helper, storage,
+                { done -> service.submitUpdate(level, operator, UUID.randomUUID(), id, 1, "moderated", "memorial",
+                    AnnotationComponents.colors.getValue("white"), EchoMutation.REPLACE, replacementClip, done) },
+            ) { updated ->
+                try {
+                    helper.assertTrue(updated?.revision == 2, "operator replacement should increment note revision")
+                    helper.assertTrue(storage.annotationEcho(id)?.annotationRevision == 2 &&
+                        storage.annotationEcho(id)?.encodedClip?.contentEquals(replacementClip) == true,
+                        "operator replacement must invalidate old echo in same shard publication")
+                    helper.succeed()
+                } finally { storage.close() }
+            }
         }
     }
 

@@ -49,6 +49,50 @@ object TracesClientRenderer {
         val endProgress: Float,
     )
     private data class GuidanceVertex(val position: Vec3, val rgb: Int, val alpha: Float)
+    private var geometryLevel: net.minecraft.world.level.Level? = null
+    private var geometryTerrainRevision = Long.MIN_VALUE
+    private var geometryTick = Long.MIN_VALUE
+    private val annotationQuads = linkedMapOf<Pair<String, Int>, SurfaceQuad?>()
+    private var cachedGuidanceRevision = Long.MIN_VALUE
+    private var cachedGuidancePosition: Vec3? = null
+    private var cachedGuidanceSegments = linkedMapOf<SegmentKey, GuidanceSegment>()
+
+    private fun checkGeometryLevel(level: net.minecraft.world.level.Level) {
+        val terrain = FootprintRenderCache.terrainRevision
+        // A one-tick ceiling also catches loaded-block edits for which Forge emits no chunk event.
+        if (geometryLevel !== level || geometryTerrainRevision != terrain || geometryTick != level.gameTime) {
+            geometryLevel = level
+            geometryTerrainRevision = terrain
+            geometryTick = level.gameTime
+            annotationQuads.clear()
+            cachedGuidanceRevision = Long.MIN_VALUE
+            cachedGuidancePosition = null
+            cachedGuidanceSegments.clear()
+        }
+    }
+
+    private fun annotationQuad(level: net.minecraft.world.level.Level,
+                               annotation: com.bettercontent.betterplayertraces.dto.VisibleAnnotationDto): SurfaceQuad? {
+        checkGeometryLevel(level)
+        val key = annotation.id to annotation.revision
+        if (key in annotationQuads) return annotationQuads[key]
+        val quad = SurfaceAnchorResolver.annotationQuad(level, annotation)
+        if (annotationQuads.size >= MAX_LABELS) annotationQuads.remove(annotationQuads.keys.first())
+        annotationQuads[key] = quad
+        return quad
+    }
+
+    private fun guidanceSegments(level: net.minecraft.world.level.Level,
+                                 routes: List<com.bettercontent.betterplayertraces.dto.GuidanceRouteDto>,
+                                 position: Vec3): LinkedHashMap<SegmentKey, GuidanceSegment> {
+        checkGeometryLevel(level)
+        if (cachedGuidanceRevision != TracesClientState.guidancePayloadRevision || cachedGuidancePosition != position) {
+            cachedGuidanceSegments = buildGuidanceSegments(level, routes, position)
+            cachedGuidanceRevision = TracesClientState.guidancePayloadRevision
+            cachedGuidancePosition = position
+        }
+        return cachedGuidanceSegments
+    }
 
     internal fun renderStage(): RenderLevelStageEvent.Stage = RenderLevelStageEvent.Stage.AFTER_PARTICLES
 
@@ -70,7 +114,8 @@ object TracesClientRenderer {
             return
         }
         val footprintData = FootprintRenderCache.renderData(
-            level, TracesClientState.visibleTraces(), TracesClientState.footprintPayloadRevision,
+            level, TracesClientState::visibleTraces, TracesClientState.footprintPayloadRevision,
+            TracesClientState::tracesForCell,
         )
         val annotations = TracesClientState.visibleAnnotations()
             .sortedBy { player.distanceToSqr(it.x + 0.5, it.y + 0.5, it.z + 0.5) }
@@ -100,7 +145,7 @@ object TracesClientRenderer {
                 submitted++
             }
             buffer.endBatch(TracesRenderTypes.bloodPools)
-            val guidanceSegments = buildGuidanceSegments(level, guidance, player.position())
+            val guidanceSegments = guidanceSegments(level, guidance, player.position())
             val guidanceConsumer = buffer.getBuffer(TracesRenderTypes.guidance)
             val animationSeconds = (level.gameTime + event.partialTick).toDouble() / 20.0
             guidanceSegments.values.forEach { segment ->
@@ -125,7 +170,7 @@ object TracesClientRenderer {
             annotations.forEach { annotation ->
                 val pos = BlockPos(annotation.x, annotation.y, annotation.z)
                 if (!visible(pos, camera, event, distance)) return@forEach
-                val quad = SurfaceAnchorResolver.annotationQuad(level, annotation) ?: return@forEach
+                val quad = annotationQuad(level, annotation) ?: return@forEach
                 drawable++
                 if (annotation.icon.isNotEmpty()) emitQuad(
                     buffer.getBuffer(TracesRenderTypes.note(annotation.icon)), pose.last().pose(), quad,

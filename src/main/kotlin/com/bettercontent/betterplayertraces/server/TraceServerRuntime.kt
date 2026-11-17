@@ -47,30 +47,24 @@ class TraceServerRuntime(val server: MinecraftServer) {
     private val capturedCounter = java.util.concurrent.atomic.AtomicLong()
     private val pendingDeathCaptures = ConcurrentHashMap<UUID, PendingDeathCapture>()
     private val lastPlayerLocations = ConcurrentHashMap<UUID, PlayerLocation>()
-    private val annotationEchoesInitialized = ConcurrentHashMap.newKeySet<String>()
+    /** One immutable archive I/O worker for every dimension in this server. */
+    private val archiveIo = com.bettercontent.betterplayertraces.storage.TraceIoCoordinator { TracesConfig.common.saveQueueBytes.get().toLong() }
+    private var stopping = false
 
     private val config = TracesConfig.common
 
     private fun levelKey(level: ServerLevel) = level.dimension().location().toString()
 
-    fun storage(level: ServerLevel): TraceStorageManager =
-        storages.getOrPut(levelKey(level)) { TraceStorageManager(level, config) }
+    fun storage(level: ServerLevel): TraceStorageManager {
+        check(!stopping) { "Trace server storage is stopping" }
+        return storages.getOrPut(levelKey(level)) { TraceStorageManager(level, config, archiveIo, ownsIo = false) }
+    }
 
     fun capture(level: ServerLevel): CaptureService =
         captureServices.getOrPut(levelKey(level)) { CaptureService(level, storage(level), config) }
 
     fun annotations(level: ServerLevel): AnnotationService =
         annotationServices.getOrPut(levelKey(level)) { AnnotationService(storage(level)) }
-
-    fun annotationEchoes(level: ServerLevel): com.bettercontent.betterplayertraces.storage.AnnotationEchoSavedData {
-        val data = com.bettercontent.betterplayertraces.storage.AnnotationEchoSavedData.get(level)
-        if (annotationEchoesInitialized.add(levelKey(level))) {
-            val valid = storage(level).allAnnotations().associate { it.id to it.revision }
-            val removed = data.prune(valid)
-            if (removed > 0) log.warn("Pruned {} orphaned or stale annotation echoes in {}", removed, levelKey(level))
-        }
-        return data
-    }
 
     fun erosion(level: ServerLevel): ErosionService =
         erosionServices.getOrPut(levelKey(level)) { ErosionService(storage(level), config) }
@@ -80,8 +74,25 @@ class TraceServerRuntime(val server: MinecraftServer) {
 
     fun onServerTick() {
         val tick = tickCounter.incrementAndGet()
-        for (level in server.allLevels) {
-            erosion(level).tick(level, tick)
+        // Completion delivery is independent of slower persistence/recovery scheduling.
+        storages.values.forEach { it.pollCompletions() }
+        val levels = server.allLevels.toList().sortedBy { levelKey(it) }
+        var aggregateVisits = 4096
+        for (index in levels.indices) {
+            val level = levels[(index + tick % levels.size) % levels.size]
+            aggregateVisits -= storages[levelKey(level)]?.tickSummaries(aggregateVisits) ?: 0
+        }
+        var erosionVisits = ErosionService.MAX_RECORDS_PER_TICK
+        for (index in levels.indices) {
+            val level = levels[(index + tick % levels.size) % levels.size]
+            erosionVisits -= erosion(level).tick(level, tick, erosionVisits)
+        }
+        // One global visit allowance across dimensions and players; rotate the first level.
+        var guidanceVisits = GuidanceService.MAX_VISITS_PER_SERVER_TICK
+        for (index in levels.indices) {
+            val level = levels[(index + tick % levels.size) % levels.size]
+            guidanceVisits -= guidance(level).tick(level, level.players(), tick, guidanceVisits)
+            if (guidanceVisits <= 0) break
         }
         if (tick % 20 == 0) {
             pendingDeathCaptures.entries.removeIf { it.value.expiresAtServerTick < server.tickCount }
@@ -116,8 +127,8 @@ class TraceServerRuntime(val server: MinecraftServer) {
         val max = BlockPos(20, level.maxBuildHeight - 1, 24)
         val store = storage(level)
         val removed = store.removeFootTraces(min, max)
-        store.removeAnnotation(UUID.nameUUIDFromBytes("traces-visual-connected-v10".toByteArray()))
-        store.removeAnnotation(UUID.nameUUIDFromBytes("traces-visual-disconnected-v10".toByteArray()))
+        stageVisualDeletion(store, UUID.nameUUIDFromBytes("traces-visual-connected-v10".toByteArray()))
+        stageVisualDeletion(store, UUID.nameUUIDFromBytes("traces-visual-disconnected-v10".toByteArray()))
         capture(level).onDimensionTeleport(player)
         capturedCounter.set(0)
         player.teleportTo(level, 0.5, 101.0, 4.5, 0.0f, 25.0f)
@@ -167,6 +178,10 @@ class TraceServerRuntime(val server: MinecraftServer) {
         )
     }
 
+    fun onChunkLoaded(level: ServerLevel, x: Int, z: Int) { erosion(level).onChunkLoaded(x, z) }
+
+    fun onChunkUnloaded(level: ServerLevel, x: Int, z: Int) { erosionServices[levelKey(level)]?.onChunkUnloaded(x, z) }
+
     fun onFluidPlaced(level: ServerLevel, blockPos: BlockPos) {
         erosion(level).onFluidTick(blockPos)
     }
@@ -181,12 +196,14 @@ class TraceServerRuntime(val server: MinecraftServer) {
         lastPlayerLocations.remove(player.uuid)
         pendingDeathCaptures.entries.removeIf { it.value.playerId == player.uuid }
         capture(player.serverLevel()).onDimensionTeleport(player)
+        guidanceServices[levelKey(player.serverLevel())]?.clearProgress(player)
     }
 
     fun onPlayerRespawn(player: ServerPlayer) {
         addLifecycleMarker(player.serverLevel(), player, TraceKind.ARRIVAL, player.position(), player.yRot)
         remember(player)
         capture(player.serverLevel()).onDimensionTeleport(player)
+        guidanceServices[levelKey(player.serverLevel())]?.clearProgress(player)
     }
 
     fun onPlayerChangedDimension(player: ServerPlayer, from: ResourceKey<Level>) {
@@ -195,9 +212,11 @@ class TraceServerRuntime(val server: MinecraftServer) {
         if (oldLevel != null && prior?.dimension == from.location().toString()) {
             addLifecycleMarker(oldLevel, player, TraceKind.DEPARTURE, prior.position, prior.yaw)
             capture(oldLevel).onDimensionTeleport(player)
+            guidanceServices[levelKey(oldLevel)]?.clearProgress(player)
         }
         addLifecycleMarker(player.serverLevel(), player, TraceKind.ARRIVAL, player.position(), player.yRot)
         capture(player.serverLevel()).onDimensionTeleport(player)
+        guidanceServices[levelKey(player.serverLevel())]?.clearProgress(player)
         remember(player)
     }
 
@@ -400,7 +419,7 @@ class TraceServerRuntime(val server: MinecraftServer) {
             )) acceptedTraces++
         }
         val annotationPos = BlockPos(-6, 101, 8)
-        val acceptedAnnotation = store.addAnnotation(
+        val acceptedAnnotation = stageVisualNote(store,
             TraceAnnotation(
                 id = fixtureAnnotationId,
                 text = "Unlinked note",
@@ -411,11 +430,10 @@ class TraceServerRuntime(val server: MinecraftServer) {
                 team = GLOBAL_TEAM,
                 revision = 1,
                 createdByInternal = fixtureAuthor,
+                encodedEcho = makeVisualAnnotationEcho(),
             ),
         )
-        if (acceptedAnnotation) {
-            attachVisualAnnotationEcho(level, fixtureAnnotationId, revision = 1, owner = fixtureAuthor)
-        } else {
+        if (!acceptedAnnotation) {
             log.warn("TRACES_VISUAL_FIXTURE omitted annotation because trace storage is backpressured")
         }
         val fixtureAnnotations = store.queryAnnotations(BlockPos(-20, 0, -20), BlockPos(20, 255, 20)).size
@@ -433,10 +451,10 @@ class TraceServerRuntime(val server: MinecraftServer) {
         val fixtureAuthor = UUID.nameUUIDFromBytes("traces-visual-author-v11".toByteArray())
         val connected = UUID.nameUUIDFromBytes("traces-visual-connected-v10".toByteArray())
         val disconnected = UUID.nameUUIDFromBytes("traces-visual-disconnected-v10".toByteArray())
-        store.removeAnnotation(connected)
+        stageVisualDeletion(store, connected)
         if (store.annotationById(disconnected) == null) {
             val pos = BlockPos(-6, 101, 8)
-            store.addAnnotation(
+            stageVisualNote(store,
                 TraceAnnotation(
                     id = disconnected,
                     text = "Unlinked note",
@@ -447,9 +465,9 @@ class TraceServerRuntime(val server: MinecraftServer) {
                     team = GLOBAL_TEAM,
                     revision = 1,
                     createdByInternal = fixtureAuthor,
+                    encodedEcho = makeVisualAnnotationEcho(),
                 ),
             )
-            attachVisualAnnotationEcho(level, disconnected, revision = 1, owner = fixtureAuthor)
         }
         log.info("TRACES_VISUAL_DISCONNECTED annotation={}", disconnected)
     }
@@ -468,11 +486,11 @@ class TraceServerRuntime(val server: MinecraftServer) {
         val fixtureAuthor = UUID.nameUUIDFromBytes("traces-visual-author-v11".toByteArray())
         val connected = UUID.nameUUIDFromBytes("traces-visual-connected-v10".toByteArray())
         val disconnected = UUID.nameUUIDFromBytes("traces-visual-disconnected-v10".toByteArray())
-        store.removeAnnotation(disconnected)
-        store.removeAnnotation(connected)
+        stageVisualDeletion(store, disconnected)
+        stageVisualDeletion(store, connected)
         val revision = level.gameTime.coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
         val pos = BlockPos(3, 101, 9)
-        store.addAnnotation(
+        stageVisualNote(store,
             TraceAnnotation(
                 id = connected,
                 text = "Trail workshop",
@@ -483,13 +501,28 @@ class TraceServerRuntime(val server: MinecraftServer) {
                 team = GLOBAL_TEAM,
                 revision = revision,
                 createdByInternal = fixtureAuthor,
+                encodedEcho = makeVisualAnnotationEcho(),
             ),
         )
-        attachVisualAnnotationEcho(level, connected, revision, fixtureAuthor)
         log.info("TRACES_VISUAL_CONNECTED annotation={} revision={}", connected, revision)
     }
 
-    private fun attachVisualAnnotationEcho(level: ServerLevel, id: UUID, revision: Int, owner: UUID) {
+    private fun stageVisualNote(store: TraceStorageManager, note: TraceAnnotation): Boolean {
+        val prior = try { store.annotationById(note.id) } catch (_: com.bettercontent.betterplayertraces.storage.TraceReadUnavailableException) { return false }
+        val accepted = store.stageNote(UUID.randomUUID(), note.id, prior?.revision, note) { result ->
+            log.info("Visual fixture note {} publication: {}", note.id, result)
+        }
+        return accepted is com.bettercontent.betterplayertraces.storage.NoteMutationResult.Pending
+    }
+
+    private fun stageVisualDeletion(store: TraceStorageManager, id: UUID) {
+        val prior = try { store.annotationById(id) } catch (_: com.bettercontent.betterplayertraces.storage.TraceReadUnavailableException) { return }
+        if (prior != null) store.stageNote(UUID.randomUUID(), id, prior.revision, null) { result ->
+            log.info("Visual fixture deletion {} publication: {}", id, result)
+        }
+    }
+
+    private fun makeVisualAnnotationEcho(): ByteArray {
         val pivots = listOf(
             0f to 0f, 0f to 0f, 0f to 0f, 0f to 0f,
             5f to 2f, 5f to 2f, -5f to 2f, -5f to 2f,
@@ -520,7 +553,7 @@ class TraceServerRuntime(val server: MinecraftServer) {
                 frames,
             ),
         )
-        annotationEchoes(level).replace(com.bettercontent.betterplayertraces.domain.AnnotationEchoRecord(id, revision, owner, encoded))
+        return encoded
     }
 
     private fun buildVisualScene(level: ServerLevel) {
@@ -549,7 +582,18 @@ class TraceServerRuntime(val server: MinecraftServer) {
     }
 
     fun close() {
-        storages.values.forEach { it.close() }
+        if (stopping) return
+        stopping = true
+        val active = storages.values.toList()
+        active.forEach { it.stopAdmission() }
+        val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(30)
+        while (System.nanoTime() < deadline) {
+            if (active.map { it.drainShutdownStep() }.all { it }) break
+            try { Thread.sleep(20) } catch (_: InterruptedException) { Thread.currentThread().interrupt(); break }
+        }
+        val remaining = java.util.concurrent.TimeUnit.NANOSECONDS.toMillis((deadline - System.nanoTime()).coerceAtLeast(0L))
+        if (!archiveIo.shutdown(remaining)) log.error("Timed out draining shared Traces archive I/O; unresolved authority remains pinned")
+        active.forEach { it.finishShutdown() }
     }
 
     private data class PendingDeathCapture(

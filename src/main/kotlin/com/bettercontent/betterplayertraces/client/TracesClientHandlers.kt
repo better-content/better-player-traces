@@ -85,13 +85,17 @@ object TracesClientHandlers {
                         it.x == target.x && it.y == target.y && it.z == target.z
                     }
                     if (existing == null || existing.canEdit) {
-                        mc.setScreen(AnnotationEditScreen(
-                            target, existing, recent.getOrNull(), recent.exceptionOrNull()?.message.orEmpty(),
-                            openingKeyCode = event.key,
-                        ))
+                        mc.setScreen(AnnotationDrafts.retainedAt(target)?.let { AnnotationEditScreen(it, openingKeyCode = event.key) }
+                            ?: AnnotationEditScreen(
+                                target, existing, recent.getOrNull(), recent.exceptionOrNull()?.message.orEmpty(),
+                                openingKeyCode = event.key,
+                            ))
                     } else {
                         mc.player?.displayClientMessage(Component.literal("This note belongs to another player"), true)
                     }
+                } else {
+                    // Air-target key explicitly opens previous-connection drafts as read-only text.
+                    AnnotationDrafts.previousSessionDraft()?.let { mc.setScreen(AnnotationEditScreen(it, openingKeyCode = event.key)) }
                 }
             }
         }
@@ -108,6 +112,7 @@ object TracesClientHandlers {
     fun onClientTick(_event: TickEvent.ClientTickEvent) {
         if (_event.phase != TickEvent.Phase.END) return
         val mc = Minecraft.getInstance()
+        AnnotationDrafts.observeContext()
         TraceSightOverlayRenderer.updateTarget(
             TracesClientState.overlayEnabled && mc.level != null && mc.player != null && mc.screen == null,
         )
@@ -133,6 +138,7 @@ object TracesClientHandlers {
     @JvmStatic
     fun onLogout(_event: ClientPlayerNetworkEvent.LoggingOut) {
         TracesClientState.clearTraceTiles()
+        AnnotationDrafts.disconnect()
         TraceObservations.reset()
         cooldown = 0
     }
@@ -141,7 +147,7 @@ object TracesClientHandlers {
     @JvmStatic
     fun onChunkLoaded(event: ChunkEvent.Load) {
         if (!event.level.isClientSide) return
-        FootprintRenderCache.invalidateCell(event.chunk.pos.x, event.chunk.pos.z)
+        FootprintRenderCache.invalidateTerrainCell(event.chunk.pos.x, event.chunk.pos.z)
     }
 
     internal fun queryIntervalTicks(overlayEnabled: Boolean): Int =

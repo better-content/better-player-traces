@@ -15,4 +15,6 @@ data class TrafficPotential(
     val regionalShare: Float = 0f,
     val serverShare: Float = 0f,
     val percentile: Float = 0f,
+    /** Global totals are explicitly unavailable until all discovered archive shards are summarized. */
+    val globalReady: Boolean = true,
 )

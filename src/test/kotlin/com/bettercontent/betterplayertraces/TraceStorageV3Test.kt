@@ -30,7 +30,7 @@ import com.bettercontent.betterplayertraces.network.nextTraceTileWireRevision
 import com.bettercontent.betterplayertraces.storage.mergeDeferredAnnotations
 import com.bettercontent.betterplayertraces.storage.CaptureAdmission
 import com.bettercontent.betterplayertraces.storage.StorageOutageFrontier
-import com.bettercontent.betterplayertraces.storage.StorageOutageStatus
+import com.bettercontent.betterplayertraces.storage.LegacyOutageStatusFixture as StorageOutageStatus
 import com.bettercontent.betterplayertraces.storage.TraceSerializer
 import com.bettercontent.betterplayertraces.storage.TraceShardState
 import com.bettercontent.betterplayertraces.util.Geometry

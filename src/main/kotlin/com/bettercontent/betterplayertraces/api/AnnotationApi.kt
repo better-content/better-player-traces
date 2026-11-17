@@ -1,15 +1,26 @@
 package com.bettercontent.betterplayertraces.api
 
 import com.bettercontent.betterplayertraces.domain.AnnotationViewResult
-import com.bettercontent.betterplayertraces.domain.TraceAnnotation
+import com.bettercontent.betterplayertraces.domain.EchoMutation
+import com.bettercontent.betterplayertraces.storage.NoteMutationResult
 import net.minecraft.core.BlockPos
+import net.minecraft.server.level.ServerLevel
 import net.minecraft.world.entity.player.Player
 import net.minecraft.world.level.Level
 import java.util.UUID
 
+/** A note command only reports durable success through its later server-thread completion. */
 interface AnnotationApi {
     fun annotationsWithin(level: Level, boundsMin: BlockPos, boundsMax: BlockPos, viewer: Player?): AnnotationViewResult
-    fun create(level: Level, viewer: Player, text: String, icon: String, color: Int, target: BlockPos): TraceAnnotation
-    fun update(level: Level, viewer: Player, id: UUID, expectedRevision: Int, text: String?, icon: String?, color: Int?): TraceAnnotation
-    fun delete(level: Level, viewer: Player, id: UUID, expectedRevision: Int): Boolean
+
+    fun submitCreate(level: ServerLevel, viewer: Player, requestId: UUID, target: BlockPos,
+                     text: String, icon: String, color: Int, echo: ByteArray?,
+                     completion: (NoteMutationResult) -> Unit): NoteMutationResult
+
+    fun submitUpdate(level: ServerLevel, viewer: Player, requestId: UUID, id: UUID, expectedRevision: Int,
+                     text: String, icon: String, color: Int, mutation: EchoMutation, echo: ByteArray?,
+                     completion: (NoteMutationResult) -> Unit): NoteMutationResult
+
+    fun submitDelete(level: ServerLevel, viewer: Player, requestId: UUID, id: UUID, expectedRevision: Int,
+                     completion: (NoteMutationResult) -> Unit): NoteMutationResult
 }

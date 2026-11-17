@@ -22,18 +22,30 @@ object FootprintRenderCache {
     internal const val CELL_SIZE_BLOCKS = 64
 
     private var levelIdentity: Level? = null
-    private var contentKey: List<VisibleTraceDto> = emptyList()
+    private var contentRevision: Long = Long.MIN_VALUE
+    private var loginTime: Long = Long.MIN_VALUE
+    private var recencyWindow: Long = Long.MIN_VALUE
     private var data = FootprintRenderData()
     private val cells = mutableMapOf<FootprintCellKey, CachedFootprintCell>()
     private val invalidatedCells = mutableSetOf<FootprintCellKey>()
+    var terrainRevision: Long = 0L
+        private set
 
-    fun renderData(level: Level, traces: List<VisibleTraceDto>, @Suppress("UNUSED_PARAMETER") revision: Long): FootprintRenderData {
-        val stable = TraceVisualModel.stableOrder(traces)
-        if (levelIdentity !== level) {
-            rebuildAll(level, stable)
-        } else if (contentKey != stable || invalidatedCells.isNotEmpty()) {
-            if (invalidatedCells.isEmpty()) rebuildAll(level, stable) else rebuildInvalidated(level, stable)
-        }
+    fun renderData(level: Level, traces: List<VisibleTraceDto>, revision: Long,
+                   local: (FootprintCellKey) -> List<VisibleTraceDto> = { key -> traces.filter { cellKey(it.x, it.z) == key } }): FootprintRenderData =
+        renderData(level, { traces }, revision, local)
+
+    fun renderData(level: Level, all: () -> List<VisibleTraceDto>, revision: Long,
+                   local: (FootprintCellKey) -> List<VisibleTraceDto>): FootprintRenderData {
+        val session = TracesClientState.sessionLoginGameTime
+        val window = com.bettercontent.betterplayertraces.config.TracesConfig.client.recencyWindowMinutes.get().toLong()
+        if (levelIdentity !== level || loginTime != session || recencyWindow != window ||
+            revision != contentRevision && invalidatedCells.isEmpty()) {
+            rebuildAll(level, all())
+        } else if (invalidatedCells.isNotEmpty()) rebuildInvalidated(level, local)
+        contentRevision = revision
+        loginTime = session
+        recencyWindow = window
         return data
     }
 
@@ -41,33 +53,39 @@ object FootprintRenderCache {
         invalidatedCells += FootprintCellKey(Math.floorDiv(chunkX, 4), Math.floorDiv(chunkZ, 4))
     }
 
+    fun invalidateTerrainCell(chunkX: Int, chunkZ: Int) {
+        invalidateCell(chunkX, chunkZ)
+        terrainRevision++
+    }
+
     fun clear() {
         data = FootprintRenderData()
-        contentKey = emptyList()
+        contentRevision = Long.MIN_VALUE
+        loginTime = Long.MIN_VALUE
+        recencyWindow = Long.MIN_VALUE
         cells.clear()
         invalidatedCells.clear()
+        terrainRevision++
         levelIdentity = null
     }
 
-    private fun rebuildAll(level: Level, stableTraces: List<VisibleTraceDto>) {
+    private fun rebuildAll(level: Level, traces: List<VisibleTraceDto>) {
         val started = System.nanoTime()
         levelIdentity = level
-        contentKey = stableTraces
         invalidatedCells.clear()
         cells.clear()
-        val resolved = resolve(level, stableTraces)
+        val resolved = resolve(level, traces)
         resolved.groupBy { footprint -> cellKey(footprint.mark.trace.x, footprint.mark.trace.z) }
             .forEach { (key, footprints) -> cells[key] = CachedFootprintCell(key, combinedBounds(footprints), footprints) }
         publish(started)
     }
 
-    private fun rebuildInvalidated(level: Level, stableTraces: List<VisibleTraceDto>) {
+    private fun rebuildInvalidated(level: Level, local: (FootprintCellKey) -> List<VisibleTraceDto>) {
         val started = System.nanoTime()
         val dirty = invalidatedCells.toSet()
         invalidatedCells.clear()
-        contentKey = stableTraces
         dirty.forEach { key ->
-            val resolved = resolve(level, stableTraces.filter { cellKey(it.x, it.z) == key })
+            val resolved = resolve(level, local(key))
             if (resolved.isEmpty()) cells.remove(key)
             else cells[key] = CachedFootprintCell(key, combinedBounds(resolved), resolved)
         }

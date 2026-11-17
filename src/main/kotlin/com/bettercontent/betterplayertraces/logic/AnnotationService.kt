@@ -1,7 +1,6 @@
 package com.bettercontent.betterplayertraces.logic
 
 import com.bettercontent.betterplayertraces.diagnostics.RuntimeDiagnostics
-import com.bettercontent.betterplayertraces.diagnostics.PlaytestLog
 import com.bettercontent.betterplayertraces.api.AnnotationApi
 import com.bettercontent.betterplayertraces.api.SeenStateService
 import com.bettercontent.betterplayertraces.domain.*
@@ -12,9 +11,13 @@ import net.minecraft.world.level.Level
 import net.minecraft.server.level.ServerPlayer
 import java.util.UUID
 import com.bettercontent.betterplayertraces.storage.AnnotationUpdateIndex
+import com.bettercontent.betterplayertraces.storage.NoteMutationResult
+import com.bettercontent.betterplayertraces.storage.NoteRejectReason
+import com.bettercontent.betterplayertraces.storage.TraceReadUnavailableException
 import net.minecraft.server.level.ServerLevel
 
 class AnnotationService(private val storage: TraceStorageManager) : AnnotationApi, SeenStateService {
+    private val pendingEchoSlots = mutableMapOf<UUID, Int>()
     private fun observe(level: Level, event: String, result: String, reason: String, id: UUID, revision: Int) {
         if (!RuntimeDiagnostics.LOG.enabled("annotation")) return
         com.bettercontent.betterplayertraces.diagnostics.FeatureObservation.annotation(
@@ -27,95 +30,108 @@ class AnnotationService(private val storage: TraceStorageManager) : AnnotationAp
         return AnnotationViewResult(annotations, unseen, viewerUuid)
     }
 
-    override fun create(level: Level, viewer: Player, text: String, icon: String, color: Int, target: BlockPos): TraceAnnotation {
-        validateAnnotationFields(text, icon, color, false)
-        requireTargetInReach(viewer, target)
-        require(storage.queryAnnotations(target, target).none {
-            it.targetBlock == target && it.createdByInternal == viewer.getUUID()
-        }) { "you already have an annotation on this block" }
-        val record = TraceAnnotation(
-            id = UUID.randomUUID(),
-            text = text,
-            icon = icon,
-            color = color,
-            position = target,
-            targetBlock = target,
-            team = GLOBAL_TEAM,
-            revision = 1,
-            createdByInternal = viewer.getUUID()
-        )
-        val admitted = storage.addAnnotation(record)
-        observe(level, "annotation.create", if (admitted) "admitted" else "rejected", if (admitted) "storage_accepted" else "capacity", record.id, record.revision)
-        check(admitted) { "Trace storage is temporarily full; annotation was not saved" }
-        (level as? ServerLevel)?.let { AnnotationUpdateIndex.get(it).touch(record.id, it.gameTime) }
-        return record
+    /** Server-thread admission only; success is reported exclusively by the publication callback. */
+    override fun submitCreate(
+        level: ServerLevel, viewer: Player, requestId: UUID, target: BlockPos,
+        text: String, icon: String, color: Int, echo: ByteArray?, completion: (NoteMutationResult) -> Unit,
+    ): NoteMutationResult {
+        val valid = try { validateInput(text, icon, color, echo) } catch (_: IllegalArgumentException) {
+            return NoteMutationResult.Rejected(NoteRejectReason.INVALID_INPUT)
+        }
+        if (!targetInReach(viewer, target)) return NoteMutationResult.Rejected(NoteRejectReason.OUT_OF_REACH)
+        if (valid != null) echoCapacity(viewer.uuid)?.let { return NoteMutationResult.Rejected(it) }
+        val id = UUID.randomUUID()
+        val record = TraceAnnotation(id, text, icon, color, target, target, GLOBAL_TEAM, 1, viewer.uuid, valid)
+        return stage(level, requestId, id, null, record, completion, if (valid != null) viewer.uuid else null)
     }
 
-    override fun update(level: Level, viewer: Player, id: UUID, expectedRevision: Int, text: String?, icon: String?, color: Int?): TraceAnnotation {
-        val current = storage.annotationById(id) ?: throw IllegalArgumentException("annotation not found")
-        if (current.createdByInternal != viewer.getUUID() && !canModerate(viewer)) {
-            observe(level, "annotation.update", "rejected", "permission", id, current.revision)
-            throw IllegalStateException("not permitted")
+    override fun submitUpdate(
+        level: ServerLevel, viewer: Player, requestId: UUID, id: UUID, expectedRevision: Int,
+        text: String, icon: String, color: Int, mutation: EchoMutation, echo: ByteArray?,
+        completion: (NoteMutationResult) -> Unit,
+    ): NoteMutationResult {
+        val current = try { storage.annotationById(id) } catch (_: TraceReadUnavailableException) {
+            return NoteMutationResult.Rejected(NoteRejectReason.STORAGE_UNAVAILABLE)
+        } ?: return NoteMutationResult.Rejected(NoteRejectReason.NOT_FOUND)
+        if (current.createdByInternal != viewer.uuid && !canModerate(viewer)) return NoteMutationResult.Rejected(NoteRejectReason.PERMISSION)
+        if (!targetInReach(viewer, current.targetBlock)) return NoteMutationResult.Rejected(NoteRejectReason.OUT_OF_REACH)
+        if (current.revision != expectedRevision) return NoteMutationResult.Rejected(NoteRejectReason.REVISION_CONFLICT)
+        if (current.revision == Int.MAX_VALUE) return NoteMutationResult.Rejected(NoteRejectReason.STORAGE_CAPACITY)
+        if ((mutation == EchoMutation.REPLACE) != (echo != null)) return NoteMutationResult.Rejected(NoteRejectReason.INVALID_INPUT)
+        val nextEcho = when (mutation) {
+            EchoMutation.KEEP -> current.encodedEcho
+            EchoMutation.REPLACE -> echo
+            EchoMutation.REMOVE -> null
         }
-        requireTargetInReach(viewer, current.targetBlock)
-        require(current.revision == expectedRevision) { "annotation changed; reopen it before saving" }
-        validateAnnotationFields(text ?: current.text, icon ?: current.icon, color ?: current.color, false)
-        return (storage.updateAnnotation(id, text, icon, color) ?: throw IllegalStateException("annotation update failed")).also {
-            observe(level, "annotation.update", "admitted", "storage_accepted", id, it.revision)
-            (level as? ServerLevel)?.let { serverLevel -> AnnotationUpdateIndex.get(serverLevel).touch(id, serverLevel.gameTime) }
+        val valid = try { validateInput(text, icon, color, nextEcho) } catch (_: IllegalArgumentException) {
+            return NoteMutationResult.Rejected(NoteRejectReason.INVALID_INPUT)
         }
+        if (valid != null && !current.hasEcho)
+            echoCapacity(current.createdByInternal)?.let { return NoteMutationResult.Rejected(it) }
+        return stage(level, requestId, id, expectedRevision,
+            current.copy(text = text, icon = icon, color = color, revision = current.revision + 1, encodedEcho = valid), completion,
+            if (valid != null && !current.hasEcho) current.createdByInternal else null)
     }
 
-    fun createComponents(level: Level, viewer: Player, text: String, icon: String, color: Int, target: BlockPos, hasEcho: Boolean): TraceAnnotation {
-        validateAnnotationFields(text, icon, color, hasEcho)
-        requireTargetInReach(viewer, target)
-        require(storage.queryAnnotations(target, target).none {
-            it.targetBlock == target && it.createdByInternal == viewer.uuid
-        }) { "you already have an annotation on this block" }
-        return TraceAnnotation(
-            UUID.randomUUID(), text, icon, color, target, target, GLOBAL_TEAM, 1, viewer.uuid,
-        ).also { annotation ->
-            val admitted = storage.addAnnotation(annotation)
-            observe(level, "annotation.create", if (admitted) "admitted" else "rejected", if (admitted) "storage_accepted" else "capacity", annotation.id, annotation.revision)
-            check(admitted) { "Trace storage is temporarily full; annotation was not saved" }
-        }.also { (level as? ServerLevel)?.let { serverLevel -> AnnotationUpdateIndex.get(serverLevel).touch(it.id, serverLevel.gameTime) } }
+    override fun submitDelete(
+        level: ServerLevel, viewer: Player, requestId: UUID, id: UUID, expectedRevision: Int,
+        completion: (NoteMutationResult) -> Unit,
+    ): NoteMutationResult {
+        val current = try { storage.annotationById(id) } catch (_: TraceReadUnavailableException) {
+            return NoteMutationResult.Rejected(NoteRejectReason.STORAGE_UNAVAILABLE)
+        } ?: return NoteMutationResult.Rejected(NoteRejectReason.NOT_FOUND)
+        if (current.createdByInternal != viewer.uuid && !canModerate(viewer)) return NoteMutationResult.Rejected(NoteRejectReason.PERMISSION)
+        if (!targetInReach(viewer, current.targetBlock)) return NoteMutationResult.Rejected(NoteRejectReason.OUT_OF_REACH)
+        if (current.revision != expectedRevision) return NoteMutationResult.Rejected(NoteRejectReason.REVISION_CONFLICT)
+        return stage(level, requestId, id, expectedRevision, null, completion)
     }
 
-    fun updateComponents(
-        level: Level,
-        viewer: Player,
-        id: UUID,
-        expectedRevision: Int,
-        text: String,
-        icon: String,
-        color: Int,
-        hasEchoAfterMutation: Boolean,
-    ): TraceAnnotation {
-        val current = storage.annotationById(id) ?: throw IllegalArgumentException("annotation not found")
-        if (current.createdByInternal != viewer.uuid && !canModerate(viewer)) throw IllegalStateException("not permitted")
-        requireTargetInReach(viewer, current.targetBlock)
-        require(current.revision == expectedRevision) { "annotation changed; reopen it before saving" }
-        validateAnnotationFields(text, icon, color, hasEchoAfterMutation)
-        return (storage.updateAnnotation(id, text, icon, color) ?: throw IllegalStateException("annotation update failed")).also {
-            observe(level, "annotation.update", "admitted", "storage_accepted", id, it.revision)
-            (level as? ServerLevel)?.let { serverLevel -> AnnotationUpdateIndex.get(serverLevel).touch(id, serverLevel.gameTime) }
+    private fun stage(
+        level: ServerLevel, requestId: UUID, id: UUID, expectedRevision: Int?, record: TraceAnnotation?,
+        completion: (NoteMutationResult) -> Unit, reservedEchoOwner: UUID? = null,
+    ): NoteMutationResult {
+        reservedEchoOwner?.let { pendingEchoSlots[it] = (pendingEchoSlots[it] ?: 0) + 1 }
+        fun releaseEchoSlot() {
+            reservedEchoOwner?.let { owner ->
+                val remaining = (pendingEchoSlots[owner] ?: 1) - 1
+                if (remaining <= 0) pendingEchoSlots.remove(owner) else pendingEchoSlots[owner] = remaining
+            }
         }
+        val result = try { storage.stageNote(requestId, id, expectedRevision, record) { outcome ->
+            if (outcome is NoteMutationResult.Committed || outcome is NoteMutationResult.Rejected ||
+                outcome is NoteMutationResult.Indeterminate && outcome.terminal) releaseEchoSlot()
+            if (outcome is NoteMutationResult.Committed) {
+                // Derived metadata is updated AFTER publication, not part of note authority.
+                runCatching {
+                    if (record == null) AnnotationUpdateIndex.get(level).remove(id)
+                    else AnnotationUpdateIndex.get(level).touch(id, level.gameTime)
+                }.onFailure { com.mojang.logging.LogUtils.getLogger().warn("Derived note return metadata unavailable for {}", id, it) }
+                runCatching { observe(level, "annotation.publish", "committed", "durable", id, record?.revision ?: expectedRevision ?: 0) }
+            }
+            completion(outcome)
+        } } catch (error: Exception) { releaseEchoSlot(); throw error }
+        if (result is NoteMutationResult.Rejected) releaseEchoSlot()
+        if (result is NoteMutationResult.Rejected)
+            runCatching { observe(level, "annotation.stage", "rejected", result.reason.name.lowercase(), id, expectedRevision ?: 0) }
+        return result
     }
 
-    override fun delete(level: Level, viewer: Player, id: UUID, expectedRevision: Int): Boolean {
-        val current = storage.annotationById(id) ?: run { observe(level, "annotation.delete", "rejected", "missing", id, expectedRevision); return false }
-        if (current.createdByInternal != viewer.getUUID() && !canModerate(viewer)) {
-            observe(level, "annotation.delete", "rejected", "permission", id, current.revision)
-            return false
-        }
-        requireTargetInReach(viewer, current.targetBlock)
-        require(current.revision == expectedRevision) { "annotation changed; reopen it before deleting" }
-        storage.setSeen(viewer.getUUID(), id, current.revision)
-        return storage.removeAnnotation(id).also { removed ->
-            observe(level, "annotation.delete", if (removed) "removed" else "rejected", if (removed) "storage_accepted" else "missing", id, expectedRevision)
-            if (removed) (level as? ServerLevel)?.let { AnnotationUpdateIndex.get(it).remove(id) }
-        }
+    private fun echoCapacity(owner: UUID): NoteRejectReason? {
+        val count = storage.echoOwnerCount(owner) ?: return NoteRejectReason.STORAGE_UNAVAILABLE
+        // Updates call this only when the existing note has no echo, so exclusion is already zero.
+        return if (count + (pendingEchoSlots[owner] ?: 0) >= com.bettercontent.betterplayertraces.domain.AnnotationEchoRecord.MAX_PER_PLAYER)
+            NoteRejectReason.STORAGE_CAPACITY else null
     }
+
+    private fun validateInput(text: String, icon: String, color: Int, echo: ByteArray?): ByteArray? {
+        // A null result is also a valid no-echo note; exceptions are handled by each caller.
+        AnnotationComponents.validate(text, icon, color, echo != null)
+        echo?.let { com.bettercontent.betterplayertraces.logic.AnnotationEchoValidation.decode(it) }
+        return echo?.copyOf()
+    }
+
+    private fun targetInReach(viewer: Player, target: BlockPos): Boolean =
+        viewer.distanceToSqr(target.x + 0.5, target.y + 0.5, target.z + 0.5) <= 64.0
 
     override fun seenRevision(player: UUID, annotationId: UUID): Int = storage.getSeen(player, annotationId)
 
@@ -138,12 +154,4 @@ class AnnotationService(private val storage: TraceStorageManager) : AnnotationAp
 
     private fun canModerate(viewer: Player): Boolean = (viewer as? ServerPlayer)?.hasPermissions(2) == true
 
-    private fun requireTargetInReach(viewer: Player, target: BlockPos) {
-        require(viewer.distanceToSqr(target.x + 0.5, target.y + 0.5, target.z + 0.5) <= 64.0) {
-            "annotation target is out of reach"
-        }
-    }
-
-    private fun validateAnnotationFields(text: String, icon: String, color: Int, hasEcho: Boolean) =
-        AnnotationComponents.validate(text, icon, color, hasEcho)
 }

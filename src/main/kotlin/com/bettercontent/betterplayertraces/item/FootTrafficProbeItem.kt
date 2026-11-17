@@ -40,8 +40,10 @@ class FootTrafficProbeItem(properties: Properties) : Item(properties) {
                     "trace=${potential.traceCount}, alive=${potential.aliveCount}, " +
                     "aliveDensity=${aliveDensity}%, seq=${potential.sequenceCount}, max=${potential.maxStrength}, mean=$mean, " +
                     "local=${potential.localSurvivingStrength}, region=${potential.regionalSurvivingStrength}, " +
-                    "server=${potential.serverSurvivingStrength}, regionShare=${potential.regionalShare}, " +
-                    "serverShare=${potential.serverShare}, percentile=${potential.percentile}"
+                    (if (potential.globalReady)
+                        "server=${potential.serverSurvivingStrength}, regionShare=${potential.regionalShare}, " +
+                            "serverShare=${potential.serverShare}, percentile=${potential.percentile}"
+                    else "server=not ready (archive summaries pending)")
             )
                 .withStyle(ChatFormatting.AQUA)
             player.displayClientMessage(msg, true)

@@ -13,6 +13,7 @@ import net.minecraft.server.level.ServerLevel
 import net.minecraftforge.event.level.BlockEvent
 import net.minecraftforge.event.level.ExplosionEvent
 import net.minecraftforge.event.level.PistonEvent
+import net.minecraftforge.event.level.ChunkEvent
 import net.minecraftforge.eventbus.api.EventPriority
 import com.bettercontent.betterplayertraces.api.ReturnSummaryApi
 import com.bettercontent.betterplayertraces.trace.TraceEpisodes
@@ -24,6 +25,7 @@ object TracesForgeEvents {
 
     @SubscribeEvent
     fun onServerStopping(event: ServerStoppingEvent) {
+        TracesNetwork.onServerStopping()
         TracesMod.removeRuntime(event.server)
     }
 
@@ -31,6 +33,7 @@ object TracesForgeEvents {
     fun onServerTick(event: TickEvent.ServerTickEvent) {
         if (event.phase != TickEvent.Phase.END) return
         TracesMod.getRuntime(event.server).onServerTick()
+        TracesNetwork.onServerTick(event.server)
     }
 
     @SubscribeEvent
@@ -79,6 +82,18 @@ object TracesForgeEvents {
     fun onRespawn(event: PlayerEvent.PlayerRespawnEvent) {
         val player = event.entity as? ServerPlayer ?: return
         TracesMod.getRuntime(player.server).onPlayerRespawn(player)
+    }
+
+    @SubscribeEvent
+    fun onChunkLoaded(event: ChunkEvent.Load) {
+        val level = event.level as? ServerLevel ?: return
+        TracesMod.getRuntime(level.server).onChunkLoaded(level, event.chunk.pos.x, event.chunk.pos.z)
+    }
+
+    @SubscribeEvent
+    fun onChunkUnloaded(event: ChunkEvent.Unload) {
+        val level = event.level as? ServerLevel ?: return
+        TracesMod.runtimeIfPresent(level.server)?.onChunkUnloaded(level, event.chunk.pos.x, event.chunk.pos.z)
     }
 
     @SubscribeEvent(priority = EventPriority.LOWEST, receiveCanceled = true)

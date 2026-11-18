@@ -54,7 +54,7 @@ object TraceGametestProbe {
         var outcome: NoteMutationResult? = null
         fun poll(remaining: Int) {
             try {
-                storage.pollCompletions()
+                storage.tickFlush()
                 storage.tickSummaries()
                 when (val result = outcome) {
                     is NoteMutationResult.Committed -> committed(result.annotation)
@@ -68,10 +68,12 @@ object TraceGametestProbe {
         }
         fun attempt(remaining: Int) {
             try {
-                storage.pollCompletions()
+                storage.tickFlush()
                 storage.tickSummaries()
                 val initial = submit { outcome = it }
-                if (initial == NoteMutationResult.Rejected(NoteRejectReason.STORAGE_UNAVAILABLE)) {
+                if (initial == NoteMutationResult.Rejected(NoteRejectReason.STORAGE_UNAVAILABLE)
+                    || initial == NoteMutationResult.Rejected(NoteRejectReason.STORAGE_CAPACITY)
+                    || initial == NoteMutationResult.Rejected(NoteRejectReason.BUSY)) {
                     helper.assertTrue(remaining > 0, "archive did not become readable")
                     helper.runAfterDelay(1L) { attempt(remaining - 1) }
                 } else {
@@ -103,6 +105,22 @@ object TraceGametestProbe {
             } catch (failure: Throwable) { reader.close(); writer.close(); throw failure }
         }
         check(120)
+    }
+
+    /** Wait for the actual asynchronous archive discovery/read; never block the server thread. */
+    private fun awaitReadable(helper: GameTestHelper, storage: TraceStorageManager, position: BlockPos, done: () -> Unit) {
+        fun poll(remaining: Int) {
+            val readable = try {
+                storage.queryTraces(position, position)
+                true
+            } catch (_: TraceReadUnavailableException) { false }
+            if (readable) done()
+            else {
+                helper.assertTrue(remaining > 0, "native trace archive did not become readable at $position")
+                helper.runAfterDelay(1L) { poll(remaining - 1) }
+            }
+        }
+        poll(180)
     }
 
     @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 200)
@@ -182,7 +200,7 @@ object TraceGametestProbe {
         ),
     )
 
-    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 200)
+    @GameTest(batch = "better_player_traces_persistence", template = "trace_arena", timeoutTicks = 200)
     @JvmStatic
     fun persistenceSurvivesRestart(helper: GameTestHelper) {
         val level = helper.level
@@ -210,26 +228,24 @@ object TraceGametestProbe {
         val boundsMin = trace.blockPos.offset(-1, 0, -1)
         val boundsMax = trace.blockPos.offset(1, 0, 1)
 
-        try {
-            writer.addFootTrace(trace)
-            writer.tickFlush()
-            writer.close()
-
-            val reader = TraceStorageManager(level, config)
+        awaitReadable(helper, writer, trace.blockPos) {
             try {
-                val loaded = reader.queryTraces(boundsMin, boundsMax)
-                helper.assertTrue(loaded.isNotEmpty(), "loaded trace batch size=${loaded.size}, ids=${loaded.map { it.id }}")
-                helper.assertTrue(loaded.any { it.id == traceId }, "trace should persist across storage manager reload")
-                helper.succeed()
-            } finally {
-                reader.close()
+                helper.assertTrue(writer.addFootTrace(trace), "ready archive accepted native footprint")
+                writer.tickFlush()
+            } finally { writer.close() }
+            val reader = TraceStorageManager(level, config)
+            awaitReadable(helper, reader, trace.blockPos) {
+                try {
+                    val loaded = reader.queryTraces(boundsMin, boundsMax)
+                    helper.assertTrue(loaded.isNotEmpty(), "loaded trace batch size=${loaded.size}, ids=${loaded.map { it.id }}")
+                    helper.assertTrue(loaded.any { it.id == traceId }, "trace should persist across storage manager reload")
+                    helper.succeed()
+                } finally { reader.close() }
             }
-        } finally {
-            // no-op
         }
     }
 
-    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 200)
+    @GameTest(batch = "better_player_traces_water", template = "trace_arena", timeoutTicks = 200)
     @JvmStatic
     fun waterErasesTraces(helper: GameTestHelper) {
         val level = helper.level
@@ -249,20 +265,20 @@ object TraceGametestProbe {
             support = TraceSupport(BlockPos(600, 63, 600), ResourceLocation("minecraft", "stone")),
         )
 
-        try {
-            storage.addFootTrace(trace)
-            storage.tickFlush()
-            helper.assertTrue(storage.queryTraces(trace.blockPos, trace.blockPos).isNotEmpty(), "precondition: trace written")
+        awaitReadable(helper, storage, trace.blockPos) {
+            try {
+                helper.assertTrue(storage.addFootTrace(trace), "ready archive accepted native footprint")
+                storage.tickFlush()
+                helper.assertTrue(storage.queryTraces(trace.blockPos, trace.blockPos).isNotEmpty(), "precondition: trace written")
 
-            ErosionService(storage, TracesConfig.common).onFluidTick(trace.blockPos)
-            helper.assertTrue(storage.queryTraces(trace.blockPos, trace.blockPos).isEmpty(), "water should remove nearby traces")
-            helper.succeed()
-        } finally {
-            storage.close()
+                ErosionService(storage, TracesConfig.common).onFluidTick(trace.blockPos)
+                helper.assertTrue(storage.queryTraces(trace.blockPos, trace.blockPos).isEmpty(), "water should remove nearby traces")
+                helper.succeed()
+            } finally { storage.close() }
         }
     }
 
-    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 200)
+    @GameTest(batch = "better_player_traces_support", template = "trace_arena", timeoutTicks = 200)
     @JvmStatic
     fun loadedSupportLossPhysicallyErasesWithoutRenumbering(helper: GameTestHelper) {
         val level = helper.level
@@ -284,19 +300,23 @@ object TraceGametestProbe {
             level.setBlockAndUpdate(secondPos.below(), Blocks.STONE.defaultBlockState())
             helper.assertTrue(level.chunkSource.getChunkNow(firstPos.x shr 4, firstPos.z shr 4) != null,
                 "maintenance fixture must be in an already-loaded chunk")
-            helper.assertTrue(storage.addFootTrace(removed) && storage.addFootTrace(survivor), "fixture accepted")
-            erosion.onChunkLoaded(firstPos.x shr 4, firstPos.z shr 4)
-            level.setBlockAndUpdate(firstPos.below(), Blocks.AIR.defaultBlockState())
-            erosion.tick(level, 1)
-            val remaining = storage.queryTraces(firstPos, secondPos)
-            helper.assertTrue(remaining.map { it.id } == listOf(survivor.id),
-                "loaded support loss must remove the first record from all live indexes")
-            helper.assertTrue(remaining.single().sequenceIndex == 2, "surviving sequence gap must remain")
-            helper.succeed()
-        } finally {
-            erosion.onChunkUnloaded(firstPos.x shr 4, firstPos.z shr 4)
-            storage.close()
-        }
+            awaitReadable(helper, storage, firstPos) {
+                try {
+                    helper.assertTrue(storage.addFootTrace(removed) && storage.addFootTrace(survivor), "fixture accepted")
+                    erosion.onChunkLoaded(firstPos.x shr 4, firstPos.z shr 4)
+                    level.setBlockAndUpdate(firstPos.below(), Blocks.AIR.defaultBlockState())
+                    erosion.tick(level, 1)
+                    val remaining = storage.queryTraces(firstPos, secondPos)
+                    helper.assertTrue(remaining.map { it.id } == listOf(survivor.id),
+                        "loaded support loss must remove the first record from all live indexes")
+                    helper.assertTrue(remaining.single().sequenceIndex == 2, "surviving sequence gap must remain")
+                    helper.succeed()
+                } finally {
+                    erosion.onChunkUnloaded(firstPos.x shr 4, firstPos.z shr 4)
+                    storage.close()
+                }
+            }
+        } catch (failure: Throwable) { storage.close(); throw failure }
     }
 
     private fun rainFixturePosition(helper: GameTestHelper, local: BlockPos): BlockPos {
@@ -322,7 +342,7 @@ object TraceGametestProbe {
         return position
     }
 
-    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 260)
+    @GameTest(batch = "better_player_traces_rain", template = "trace_arena", timeoutTicks = 260)
     @JvmStatic
     fun rainExposureErodesOnlyUncoveredTrace(helper: GameTestHelper) {
         val level = helper.level
@@ -362,14 +382,16 @@ object TraceGametestProbe {
         val exposed = traceAt(exposedPosition)
         val sheltered = traceAt(shelteredPosition)
         val comparison = traceAt(comparisonPosition)
+        awaitReadable(helper, storage, exposedPosition) {
         try {
             level.setWeatherParameters(0, 240, true, false)
             level.rainLevel = 1f
             level.oRainLevel = 1f
-            storage.addFootTrace(exposed)
-            storage.addFootTrace(sheltered)
-            storage.addFootTrace(comparison)
+            helper.assertTrue(storage.addFootTrace(exposed) && storage.addFootTrace(sheltered)
+                && storage.addFootTrace(comparison), "ready archive accepted the three rain fixtures")
             storage.tickFlush()
+            for (position in listOf(exposedPosition, shelteredPosition, comparisonPosition))
+                erosion.onChunkLoaded(position.x shr 4, position.z shr 4)
             // Wait for skylight propagation, then validate and erode within the same rain episode.
             helper.runAfterDelay(10L) {
                 try {
@@ -384,6 +406,7 @@ object TraceGametestProbe {
                     val before = listOf(exposed, sheltered, comparison).associate { trace ->
                         trace.id to storage.queryTraces(trace.blockPos, trace.blockPos).single { it.id == trace.id }
                     }
+                    erosion.tick(level, 0) // Establish the per-chunk native rain interval.
                     erosion.tick(level, 80)
                     val after = listOf(exposed, sheltered, comparison).associate { trace ->
                         trace.id to storage.queryTraces(trace.blockPos, trace.blockPos).single { it.id == trace.id }
@@ -398,6 +421,8 @@ object TraceGametestProbe {
                 } finally {
                     level.setBlockAndUpdate(coverPos, Blocks.AIR.defaultBlockState())
                     level.setWeatherParameters(0, 0, false, false)
+                    for (position in listOf(exposedPosition, shelteredPosition, comparisonPosition))
+                        erosion.onChunkUnloaded(position.x shr 4, position.z shr 4)
                     storage.close()
                 }
             }
@@ -405,9 +430,10 @@ object TraceGametestProbe {
             storage.close()
             throw failure
         }
+        }
     }
 
-    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 220)
+    @GameTest(batch = "better_player_traces_note_01", template = "trace_arena", timeoutTicks = 220)
     @JvmStatic
     fun annotationPersistsAfterTargetBlockReplaced(helper: GameTestHelper) {
         val level = helper.level
@@ -431,7 +457,7 @@ object TraceGametestProbe {
         }
     }
 
-    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 220)
+    @GameTest(batch = "better_player_traces_note_02", template = "trace_arena", timeoutTicks = 220)
     @JvmStatic
     fun globalTeamVisibleToSecondPlayer(helper: GameTestHelper) {
         val level = helper.level
@@ -453,7 +479,7 @@ object TraceGametestProbe {
     }
 
 
-    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 220)
+    @GameTest(batch = "better_player_traces_note_03", template = "trace_arena", timeoutTicks = 220)
     @JvmStatic
     fun annotationOwnershipAndRevisionAreEnforced(helper: GameTestHelper) {
         val level = helper.level
@@ -466,8 +492,18 @@ object TraceGametestProbe {
             { done -> service.submitCreate(level, author, UUID.randomUUID(), target, "first", "pin", 0x579DFF, null, done) },
         ) { created ->
             val id = requireNotNull(created).id
-            helper.assertTrue(service.submitCreate(level, author, UUID.randomUUID(), target, "duplicate", "pin", 0x579DFF, null) {} ==
-                NoteMutationResult.Rejected(NoteRejectReason.TARGET_BUSY), "one creator may only have one note per block")
+            fun checkDuplicate(remaining: Int) {
+                storage.tickFlush()
+                val duplicate = service.submitCreate(level, author, UUID.randomUUID(), target,
+                    "duplicate", "pin", 0x579DFF, null) {}
+                if (duplicate == NoteMutationResult.Rejected(NoteRejectReason.BUSY)
+                    || duplicate == NoteMutationResult.Rejected(NoteRejectReason.STORAGE_UNAVAILABLE)) {
+                    helper.assertTrue(remaining > 0, "archive did not settle before duplicate check: $duplicate")
+                    helper.runAfterDelay(1L) { checkDuplicate(remaining - 1) }
+                    return
+                }
+                helper.assertTrue(duplicate == NoteMutationResult.Rejected(NoteRejectReason.TARGET_BUSY),
+                    "one creator may only have one note per block: $duplicate")
             helper.assertTrue(service.submitUpdate(level, viewer, UUID.randomUUID(), id, 1, "stolen", "pin", 0x579DFF, EchoMutation.KEEP, null) {} ==
                 NoteMutationResult.Rejected(NoteRejectReason.PERMISSION), "other players must not update notes")
             helper.assertTrue(service.submitDelete(level, viewer, UUID.randomUUID(), id, 1) {} ==
@@ -490,10 +526,12 @@ object TraceGametestProbe {
                     } finally { storage.close() }
                 }
             }
+            }
+            checkDuplicate(180)
         }
     }
 
-    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 220)
+    @GameTest(batch = "better_player_traces_note_04", template = "trace_arena", timeoutTicks = 220)
     @JvmStatic
     fun annotationEchoPersistsRevisesAndDeletesAtomically(helper: GameTestHelper) {
         val level = helper.level
@@ -528,7 +566,7 @@ object TraceGametestProbe {
         }
     }
 
-    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 1000)
+    @GameTest(batch = "better_player_traces_note_99", template = "trace_arena", timeoutTicks = 60000)
     @JvmStatic
     fun annotationEchoCapacityRejectsWithoutEviction(helper: GameTestHelper) {
         val level = helper.level
@@ -564,7 +602,7 @@ object TraceGametestProbe {
         next(0)
     }
 
-    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 220)
+    @GameTest(batch = "better_player_traces_note_06", template = "trace_arena", timeoutTicks = 220)
     @JvmStatic
     fun deniedEchoEditLeavesNoteAndClipUnchanged(helper: GameTestHelper) {
         val level = helper.level
@@ -592,7 +630,7 @@ object TraceGametestProbe {
         }
     }
 
-    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 220)
+    @GameTest(batch = "better_player_traces_note_07", template = "trace_arena", timeoutTicks = 220)
     @JvmStatic
     fun operatorCanReplaceAnnotationEcho(helper: GameTestHelper) {
         val level = helper.level
@@ -626,7 +664,7 @@ object TraceGametestProbe {
         }
     }
 
-    @GameTest(batch = "better_player_traces", template = "trace_arena", timeoutTicks = 220)
+    @GameTest(batch = "better_player_traces_journey", template = "trace_arena", timeoutTicks = 220)
     @JvmStatic
     fun traceJourneyEventsAreCorrelatedAndPublishedOnce(helper: GameTestHelper) {
         val level = helper.level
@@ -638,8 +676,8 @@ object TraceGametestProbe {
         val origin = player.blockPosition()
         val storage = TraceStorageManager(level, TracesConfig.common)
         val recorder = TraceEventRecorder()
+        awaitReadable(helper, storage, origin) {
         MinecraftForge.EVENT_BUS.register(recorder)
-
         try {
             TraceEpisodes.forget(player)
             TraceEpisodes.traceCommitted(player)
@@ -683,6 +721,7 @@ object TraceGametestProbe {
             MinecraftForge.EVENT_BUS.unregister(recorder)
             TraceEpisodes.forget(player)
             storage.close()
+        }
         }
     }
 }

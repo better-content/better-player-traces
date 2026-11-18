@@ -82,8 +82,8 @@ class TraceCoreTest {
     fun dimensionStorageRetainsNamespaceAndLivesInsideWorld(@TempDir dir: Path) {
         val first = TraceStorageManager.dimensionRoot(dir, ResourceLocation("moda", "moon"))
         val second = TraceStorageManager.dimensionRoot(dir, ResourceLocation("modb", "moon"))
-        assertEquals(dir.resolve("data/traces/moda/moon").toAbsolutePath().normalize(), first)
-        assertEquals(dir.resolve("data/traces/modb/moon").toAbsolutePath().normalize(), second)
+        assertEquals(dir.resolve("data/better_player_traces/moda/moon").toAbsolutePath().normalize(), first)
+        assertEquals(dir.resolve("data/better_player_traces/modb/moon").toAbsolutePath().normalize(), second)
         assertFalse(first == second)
     }
 

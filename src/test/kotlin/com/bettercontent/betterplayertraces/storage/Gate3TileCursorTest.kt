@@ -2,9 +2,11 @@ package com.bettercontent.betterplayertraces.storage
 
 import com.bettercontent.betterplayertraces.domain.FootTrace
 import com.bettercontent.betterplayertraces.domain.MovementClass
+import com.bettercontent.betterplayertraces.domain.TraceSupport
 import com.bettercontent.betterplayertraces.domain.TraceAnnotation
 import com.bettercontent.betterplayertraces.domain.GLOBAL_TEAM
 import net.minecraft.core.BlockPos
+import net.minecraft.resources.ResourceLocation
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
 import java.util.UUID
@@ -37,7 +39,8 @@ class Gate3TileCursorTest {
         val marks = (0 until 1_100).map { i ->
             FootTrace(UUID(0, i.toLong() + 1), "minecraft:overworld", (i % 16) + 0.5,
                 64.0, 0.5, 0f, MovementClass.WALK, 1f, sequence, i,
-                i.toLong(), 1, true, owner)
+                i.toLong(), 1, true, owner,
+                support = TraceSupport(BlockPos(i % 16, 63, 0), ResourceLocation("minecraft", "stone")))
         }
         marks.forEach(state::addFootTrace)
         assertEquals(1_100, state.livingTraceTileCount(0, 0))

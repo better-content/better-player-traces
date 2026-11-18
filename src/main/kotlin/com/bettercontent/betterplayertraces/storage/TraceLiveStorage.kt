@@ -809,7 +809,10 @@ class TraceStorageManager(
                     if (loaded[id]?.dirty != true) io.releaseDirty(id)
                     failedWrites.remove(id)
                 }
-                false -> { paused = true; conflicts.add(id) }
+                false -> {
+                    log.warn("Trace archive snapshot conflict: shard={} requestedRevision={}", id, pending.revision)
+                    paused = true; conflicts.add(id)
+                }
                 null -> { paused = true; failedWrites.add(id) }
             }
             writes.remove(id)
@@ -908,7 +911,7 @@ class TraceStorageManager(
         }
         if (writes.isNotEmpty() || notes.isNotEmpty() || reads.isNotEmpty() || loaded.values.any { it.dirty })
             log.error("Trace archive shutdown unresolved: dimension={} dirty={} writes={} notes={} reads={} conflicts={}",
-                dimensionName, loaded.values.count { it.dirty }, writes.size, notes.size, reads.size, conflicts.size)
+                dimensionName, loaded.values.count { it.dirty }, writes.size, notes.size, reads.size, conflicts)
     }
 }
 

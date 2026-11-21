@@ -1,6 +1,8 @@
 package com.bettercontent.betterplayertraces.trace
 
 import com.bettercontent.betterplayertraces.api.event.TraceEpisodeEvent
+import com.bettercontent.betterplayertraces.storage.ShardRead
+import com.bettercontent.betterplayertraces.storage.TraceReadUnavailableException
 import com.bettercontent.betterplayertraces.storage.TraceStorageManager
 import net.minecraft.core.BlockPos
 import net.minecraft.nbt.CompoundTag
@@ -48,10 +50,17 @@ object TraceEpisodes {
             return
         }
         if (!state.armed) return
-        val oldOwnTrace = storage.queryTraces(
-            BlockPos(center.x - 8, center.y - 8, center.z - 8),
-            BlockPos(center.x + 8, center.y + 8, center.z + 8),
-        ).any { it.sourcePlayerInternal == player.uuid && it.createdAt <= player.serverLevel().gameTime - 6000 }
+        // An archive shard can still be loading after a new trace is recorded. Keep the
+        // journey armed and retry on the next player tick instead of throwing on the server thread.
+        val oldOwnTrace = try {
+            storage.queryTraces(
+                BlockPos(center.x - 8, center.y - 8, center.z - 8),
+                BlockPos(center.x + 8, center.y + 8, center.z + 8),
+            ).any { it.sourcePlayerInternal == player.uuid && it.createdAt <= player.serverLevel().gameTime - 6000 }
+        } catch (error: TraceReadUnavailableException) {
+            if (error.status != ShardRead.Loading) throw error
+            return
+        }
         if (oldOwnTrace) {
             returns.remove(player.uuid)
             clear(player)

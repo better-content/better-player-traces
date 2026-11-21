@@ -704,23 +704,42 @@ object TraceGametestProbe {
             ))
             player.tickCount = 40
             player.setPos(origin.x.toDouble(), origin.y.toDouble(), origin.z.toDouble())
-            TraceEpisodes.checkReturn(player, storage)
-            TraceEpisodes.checkReturn(player, storage)
-
-            helper.assertTrue(recorder.events.size == 2, "return must publish once and close the journey")
-            val committed = recorder.events[0]
-            val returned = recorder.events[1]
-            helper.assertTrue(committed.kind == TraceEpisodeEvent.Kind.COMMITTED, "first boundary must be COMMITTED")
-            helper.assertTrue(returned.kind == TraceEpisodeEvent.Kind.RETURNED, "second boundary must be RETURNED")
-            helper.assertTrue(committed.episodeId == returned.episodeId, "journey boundaries must share an episode ID")
-            helper.assertTrue(committed.player === player && returned.player === player, "events must expose the authoritative player")
-            helper.assertTrue(committed.originDimension == level.dimension() && committed.origin == origin,
-                "event must retain the journey origin")
-            helper.succeed()
-        } finally {
+            fun checkWhenReadable(remaining: Int) {
+                var scheduled = false
+                try {
+                    // The first server-side return check can arrive while the new shard is loading.
+                    TraceEpisodes.checkReturn(player, storage)
+                    TraceEpisodes.checkReturn(player, storage)
+                    if (recorder.events.size == 1) {
+                        helper.assertTrue(remaining > 0, "return must publish after the archive becomes readable")
+                        helper.runAfterDelay(1L) { checkWhenReadable(remaining - 1) }
+                        scheduled = true
+                        return
+                    }
+                    helper.assertTrue(recorder.events.size == 2, "return must publish once and close the journey")
+                    val committed = recorder.events[0]
+                    val returned = recorder.events[1]
+                    helper.assertTrue(committed.kind == TraceEpisodeEvent.Kind.COMMITTED, "first boundary must be COMMITTED")
+                    helper.assertTrue(returned.kind == TraceEpisodeEvent.Kind.RETURNED, "second boundary must be RETURNED")
+                    helper.assertTrue(committed.episodeId == returned.episodeId, "journey boundaries must share an episode ID")
+                    helper.assertTrue(committed.player === player && returned.player === player, "events must expose the authoritative player")
+                    helper.assertTrue(committed.originDimension == level.dimension() && committed.origin == origin,
+                        "event must retain the journey origin")
+                    helper.succeed()
+                } finally {
+                    if (!scheduled) {
+                        MinecraftForge.EVENT_BUS.unregister(recorder)
+                        TraceEpisodes.forget(player)
+                        storage.close()
+                    }
+                }
+            }
+            checkWhenReadable(180)
+        } catch (failure: Throwable) {
             MinecraftForge.EVENT_BUS.unregister(recorder)
             TraceEpisodes.forget(player)
             storage.close()
+            throw failure
         }
         }
     }
